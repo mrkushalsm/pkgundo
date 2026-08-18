@@ -12,6 +12,7 @@ mod inspect;
 mod journal;
 mod process_tracker;
 mod rollback;
+mod scan_leftovers;
 mod service_tracker;
 mod tracked_apps;
 mod transaction;
@@ -69,8 +70,8 @@ async fn main() -> Result<()> {
         Commands::Tracked { all } => {
             commands::track::handle_tracked(*all).await?;
         }
-        Commands::ScanLeftovers { app: _, dry_run: _ } => {
-            println!("scan-leftovers is not implemented yet");
+        Commands::ScanLeftovers { app, dry_run } => {
+            commands::scan_leftovers::handle_scan_leftovers(app, *dry_run, db_path)?;
         }
         Commands::Daemon => {
             daemon::run_daemon(db_path).await?;

@@ -2,6 +2,7 @@ pub mod query;
 pub mod recover;
 pub mod rollback;
 pub mod run;
+pub mod scan_leftovers;
 pub mod simulate;
 pub mod track;
 

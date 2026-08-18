@@ -48,6 +48,18 @@ fn is_executable_candidate(path: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Parse a `pacman -Ql <pkg>` style listing (`<pkg> <path>` per line) into
+/// the subset of paths that look like real executable binaries. Shared with
+/// `scan_leftovers`, which needs the same filtering for both live `pacman
+/// -Ql` output and a cached archive's extracted file list.
+pub fn executable_binaries_from_listing(listing: &str) -> Vec<String> {
+    listing
+        .lines()
+        .filter_map(|line| line.split_once(' ').map(|(_, p)| p.trim().to_string()))
+        .filter(|p| is_executable_candidate(p))
+        .collect()
+}
+
 /// Resolve `app` to either a pacman package's owned binaries, or a literal
 /// binary path/name. Tries package resolution first, falls back to treating
 /// `app` as a binary.
@@ -56,11 +68,7 @@ pub fn resolve_app_targets(app: &str) -> Result<ResolvedTarget> {
         if let Ok(output) = Command::new("pacman").args(["-Ql", app]).output() {
             if output.status.success() {
                 let listing = String::from_utf8_lossy(&output.stdout);
-                let binaries: Vec<String> = listing
-                    .lines()
-                    .filter_map(|line| line.split_once(' ').map(|(_, p)| p.trim().to_string()))
-                    .filter(|p| is_executable_candidate(p))
-                    .collect();
+                let binaries = executable_binaries_from_listing(&listing);
                 if !binaries.is_empty() {
                     return Ok(ResolvedTarget::Package { package_name: app.to_string(), binaries });
                 }
