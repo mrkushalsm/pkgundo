@@ -18,6 +18,12 @@ pub async fn handle_track(app: &str) -> Result<()> {
 }
 
 /// Handle `pkgundo untrack <app> [--rollback [--mode ...] [--dry-run]]`
+///
+/// `--dry-run` means nothing happens at all — same as every other dry-run
+/// flag in this codebase — so it must skip the real `Untrack` IPC call too,
+/// not just the file removal: that call has a real, permanent side effect
+/// (flips the app to untracked), and running it during a "preview" would
+/// leave the app silently untracked even though no files were touched.
 pub async fn handle_untrack(
     app: &str,
     rollback: bool,
@@ -28,6 +34,10 @@ pub async fn handle_untrack(
     if rollback && !is_root() {
         eprintln!("{} pkgundo untrack --rollback requires root privileges.", "Error:".red());
         std::process::exit(1);
+    }
+
+    if rollback && dry_run {
+        return preview_rollback(app, mode, db_path);
     }
 
     match send_request(Request::Untrack { name: app.to_string() }).await? {
@@ -49,28 +59,46 @@ pub async fn handle_untrack(
     // The daemon only owns the IPC/tracking side; rollback executes
     // CLI-side against the DB and filesystem directly, exactly like the
     // standalone `pkgundo rollback <txid>` command.
-    let conn = crate::db::open_db_readonly(db_path).context("Failed to open pkgundo database")?;
-    let tracked = crate::tracked_apps::load_tracked_app(&conn, app)?
-        .with_context(|| format!("'{}' has no recorded tracking history to roll back", app))?;
-    drop(conn);
-
+    let tracked = load_tracked(app, db_path)?;
     println!(
         "{} Rolling back accumulated $HOME mutations for '{}' (txid {})",
         "→".yellow(),
         app,
         tracked.txid.to_string().cyan()
     );
-    if dry_run {
-        println!("  {}", "[DRY RUN — no changes will be made]".yellow().bold());
-    }
 
-    let engine =
-        RollbackEngine::new(tracked.txid, RollbackMode::from_str(mode), dry_run, db_path)
-            .with_home_cleanup(true);
+    let engine = RollbackEngine::new(tracked.txid, RollbackMode::from_str(mode), false, db_path)
+        .with_home_cleanup(true);
     let report = engine.execute()?;
     report.print_summary();
 
     Ok(())
+}
+
+/// `--rollback --dry-run`: preview only, no IPC call, no DB/filesystem
+/// writes at all — the app stays tracked exactly as it was before.
+fn preview_rollback(app: &str, mode: &str, db_path: &str) -> Result<()> {
+    let tracked = load_tracked(app, db_path)?;
+    println!(
+        "{} Previewing rollback for '{}' (txid {})",
+        "→".yellow(),
+        app,
+        tracked.txid.to_string().cyan()
+    );
+    println!("  {}", "[DRY RUN — no changes will be made, still tracked]".yellow().bold());
+
+    let engine = RollbackEngine::new(tracked.txid, RollbackMode::from_str(mode), true, db_path)
+        .with_home_cleanup(true);
+    let report = engine.execute()?;
+    report.print_summary();
+
+    Ok(())
+}
+
+fn load_tracked(app: &str, db_path: &str) -> Result<crate::tracked_apps::TrackedApp> {
+    let conn = crate::db::open_db_readonly(db_path).context("Failed to open pkgundo database")?;
+    crate::tracked_apps::load_tracked_app(&conn, app)?
+        .with_context(|| format!("'{}' has no recorded tracking history to roll back", app))
 }
 
 /// Handle `pkgundo tracked [--all]`

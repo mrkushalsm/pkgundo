@@ -272,7 +272,7 @@ impl RollbackEngine {
             // like a freshly created file for rollback purposes, or it's
             // permanently invisible to cleanup.
             "create" | "rename_to" => self.handle_created_file(conn, archive_mgr, path),
-            "modify" => self.handle_modified_file(conn, archive_mgr, path_str),
+            "modify" => self.handle_modified_file(conn, archive_mgr, path),
             "delete" => self.handle_deleted_file(conn, path_str),
             // The source path of a rename no longer has anything at it —
             // nothing to restore there.
@@ -375,13 +375,33 @@ impl RollbackEngine {
         &self,
         conn: &Connection,
         archive_mgr: &ArchiveManager,
-        path_str: &str,
+        path: &Path,
     ) -> Result<FileRollbackResult> {
+        let path_str = path.to_string_lossy().to_string();
         // For configs specifically, always archive before restoring
-        let pre_fp = get_fingerprint_for_path(conn, self.txid, path_str, "pre")?;
+        let pre_fp = get_fingerprint_for_path(conn, self.txid, &path_str, "pre")?;
         let current_diff = if let Some(ref pre) = pre_fp {
             compare_with_current(pre)
         } else {
+            // No "pre" baseline exists at all for tracked-app launches (there's
+            // no pre_scan_configs step outside a `pkgundo run` install), so
+            // this is the common case for a file touched on a later launch,
+            // not a rare one — under home_cleanup there's nothing meaningful
+            // to "restore" (no baseline means no prior state to speak of), so
+            // treat it like a created file: archive current content, then
+            // remove. Otherwise (regular install rollback), preserve the
+            // existing conservative behavior of leaving it alone entirely.
+            if self.home_cleanup {
+                if !self.dry_run {
+                    if path.is_symlink() || path.is_file() {
+                        archive_mgr.archive_file(conn, self.txid, &path_str, false)?;
+                        fs::remove_file(path).context(format!("Failed to remove {}", path_str))?;
+                    } else if path.is_dir() {
+                        let _ = fs::remove_dir(path);
+                    }
+                }
+                return Ok(FileRollbackResult::Archived(path_str));
+            }
             log::info!("SKIPTAG:modify-no-baseline {}", path_str);
             return Ok(FileRollbackResult::Skipped(path_str.to_string()));
         };
@@ -390,7 +410,7 @@ impl RollbackEngine {
             FingerprintDiff::Unchanged => {
                 // File is still at the post-install state — restore the original via blob
                 if !self.dry_run {
-                    match blob_store::restore_from_blob(conn, self.txid, path_str) {
+                    match blob_store::restore_from_blob(conn, self.txid, &path_str) {
                         Ok(true) => return Ok(FileRollbackResult::Restored(path_str.to_string())),
                         Ok(false) => {}
                         Err(e) => log::debug!("Blob restore: {}", e),
@@ -404,15 +424,15 @@ impl RollbackEngine {
                 match &self.mode {
                     RollbackMode::Conservative | RollbackMode::Clean => {
                         if !self.dry_run {
-                            archive_mgr.archive_file(conn, self.txid, path_str, true)?;
+                            archive_mgr.archive_file(conn, self.txid, &path_str, true)?;
                             // Try to restore original from blob
-                            let _ = blob_store::restore_from_blob(conn, self.txid, path_str);
+                            let _ = blob_store::restore_from_blob(conn, self.txid, &path_str);
                         }
                         Ok(FileRollbackResult::Archived(path_str.to_string()))
                     }
                     RollbackMode::Nuclear => {
                         if !self.dry_run {
-                            let _ = blob_store::restore_from_blob(conn, self.txid, path_str);
+                            let _ = blob_store::restore_from_blob(conn, self.txid, &path_str);
                         }
                         Ok(FileRollbackResult::Restored(path_str.to_string()))
                     }
