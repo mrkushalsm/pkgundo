@@ -57,6 +57,15 @@ pub struct RollbackEngine {
     /// None means "use the default". Exists so tests can archive into a temp
     /// dir instead of the real system path, which requires root.
     archive_root: Option<String>,
+    /// When true, bypasses the `UserData` → `NeverTouch` short-circuit for
+    /// paths under `$HOME`, and forces archive-before-remove even for
+    /// freshly-created/untouched files. Default false — the standalone
+    /// `pkgundo rollback <txid>` command must never set this; a routine
+    /// install-time rollback has no legitimate reason to delete anything in
+    /// a user's home directory, and that protection must stay exactly as
+    /// strict as it is today. Only tracked-app `untrack --rollback` (which
+    /// intentionally captures $HOME mutations) sets this.
+    home_cleanup: bool,
 }
 
 impl RollbackEngine {
@@ -67,6 +76,7 @@ impl RollbackEngine {
             dry_run,
             db_path: db_path.to_string(),
             archive_root: None,
+            home_cleanup: false,
         }
     }
 
@@ -74,6 +84,14 @@ impl RollbackEngine {
     /// this unset and get the real /var/lib/pkgundo/archives location).
     pub fn with_archive_root(mut self, root: impl Into<String>) -> Self {
         self.archive_root = Some(root.into());
+        self
+    }
+
+    /// Allow this rollback to actually touch `$HOME` paths, for tracked-app
+    /// cleanup. See the `home_cleanup` field doc for why this must stay
+    /// opt-in and default false.
+    pub fn with_home_cleanup(mut self, on: bool) -> Self {
+        self.home_cleanup = on;
         self
     }
 
@@ -233,9 +251,10 @@ impl RollbackEngine {
         let path = Path::new(path_str);
         let action = rollback_action_for_category(category);
 
-        // Always skip user data
+        // Always skip user data, unless this rollback was explicitly opted
+        // into touching $HOME (tracked-app cleanup) via `home_cleanup`.
         match action {
-            RollbackAction::NeverTouch => {
+            RollbackAction::NeverTouch if !self.home_cleanup => {
                 log::info!("SKIPTAG:nevertouch {}", path_str);
                 return Ok(FileRollbackResult::Skipped(path_str.to_string()));
             }
@@ -292,10 +311,21 @@ impl RollbackEngine {
 
         match current_diff {
             FingerprintDiff::Unchanged | FingerprintDiff::New => {
-                // File unchanged since install — safe to remove
+                // File unchanged since install — safe to remove outright for
+                // disposable install artifacts. But once `home_cleanup` is
+                // set (tracked-app $HOME cleanup), deleting without a backup
+                // is a real data-loss risk in a way it isn't for /usr/bin
+                // cruft — archive first, matching what `scan_leftovers`
+                // already guarantees unconditionally for its own removals.
                 match &self.mode {
                     RollbackMode::Conservative | RollbackMode::Clean | RollbackMode::Nuclear => {
+                        // Directories have nothing to archive (ArchiveManager
+                        // copies file content); only files/symlinks get one.
+                        let archived = self.home_cleanup && (path.is_symlink() || path.is_file());
                         if !self.dry_run {
+                            if archived {
+                                archive_mgr.archive_file(conn, self.txid, &path_str, false)?;
+                            }
                             if path.is_symlink() || path.is_file() {
                                 fs::remove_file(path).context(format!("Failed to remove {}", path_str))?;
                             } else if path.is_dir() {
@@ -303,7 +333,11 @@ impl RollbackEngine {
                                 let _ = fs::remove_dir(path);
                             }
                         }
-                        Ok(FileRollbackResult::Removed(path_str))
+                        if archived {
+                            Ok(FileRollbackResult::Archived(path_str))
+                        } else {
+                            Ok(FileRollbackResult::Removed(path_str))
+                        }
                     }
                 }
             }

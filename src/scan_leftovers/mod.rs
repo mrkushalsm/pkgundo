@@ -467,10 +467,31 @@ fn home_dir_for_user(user: &str) -> Option<PathBuf> {
     line.trim().split(':').nth(5).map(PathBuf::from)
 }
 
+/// Resolve a uid to its home directory, for the daemon's exec-watch path
+/// (a launching process's real uid, not a username). `getent passwd` accepts
+/// a numeric uid exactly like a username, so this just reuses the same
+/// lookup+field-split as `home_dir_for_user`.
+pub(crate) fn home_dir_for_uid(uid: u32) -> Option<PathBuf> {
+    home_dir_for_user(&uid.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn home_dir_for_uid_resolves_root() {
+        // uid 0 (root) is universal on any Linux system this test runs on,
+        // same reasoning as this module's other tests that lean on real
+        // system state (`getent`/`pacman`) rather than mocking everything.
+        assert_eq!(home_dir_for_uid(0), Some(PathBuf::from("/root")));
+    }
+
+    #[test]
+    fn home_dir_for_uid_none_for_nonexistent() {
+        assert_eq!(home_dir_for_uid(u32::MAX), None);
+    }
 
     struct FakeSource {
         info: HashMap<String, String>,
