@@ -60,6 +60,21 @@ async fn main() -> Result<()> {
         Commands::Simulate { args } => {
             commands::simulate::handle_simulate(args)?;
         }
+        Commands::Track { app } => {
+            commands::track::handle_track(app).await?;
+        }
+        Commands::Untrack { app } => {
+            commands::track::handle_untrack(app).await?;
+        }
+        Commands::Tracked { all } => {
+            commands::track::handle_tracked(*all).await?;
+        }
+        Commands::ScanLeftovers { app: _, dry_run: _ } => {
+            println!("scan-leftovers is not implemented yet");
+        }
+        Commands::Daemon => {
+            daemon::run_daemon(db_path).await?;
+        }
     }
 
     Ok(())

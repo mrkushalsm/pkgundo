@@ -69,4 +69,40 @@ pub enum Commands {
         #[arg(trailing_var_arg = true, required = true)]
         args: Vec<String>,
     },
+
+    /// Track an app so pkgundo daemon watches it across its whole life.
+    /// Example: pkgundo track firefox
+    Track {
+        /// Package name or binary path/name to track
+        app: String,
+    },
+
+    /// Stop tracking a previously tracked app.
+    /// Example: pkgundo untrack firefox
+    Untrack {
+        /// Package name or binary path/name to stop tracking
+        app: String,
+    },
+
+    /// List tracked apps.
+    Tracked {
+        /// Include untracked (historical) entries, not just currently-tracking apps
+        #[arg(long, default_value = "false")]
+        all: bool,
+    },
+
+    /// Scan for leftover files of an app under $HOME (installed or already removed).
+    /// Example: pkgundo scan-leftovers firefox --dry-run
+    ScanLeftovers {
+        /// Package name or app identifier to scan for
+        app: String,
+
+        /// Only print candidates, don't archive/remove anything
+        #[arg(long, default_value = "false")]
+        dry_run: bool,
+    },
+
+    /// Run the pkgundo daemon (used by systemd; not intended for direct interactive use).
+    #[command(hide = true)]
+    Daemon,
 }
