@@ -304,11 +304,20 @@ impl FanotifyMonitor {
     /// distinct filesystems) and skips the resolve work entirely for
     /// everything else. Returns (mask, pid, resolved path, txid) tuples,
     /// already filtered to paths under the matched launch's home dir.
+    /// Returns the matched events, plus whether this read filled the entire
+    /// buffer — a signal that more events are very likely still queued in
+    /// the kernel and should be drained immediately rather than waiting out
+    /// the normal poll interval. Under a fast burst (e.g. npm extracting a
+    /// package, hundreds of files in well under a second), a fixed sleep
+    /// between every read let a launch's root process exit — pruning its
+    /// pid from `active_launches` — before already-generated kernel events
+    /// for that pid had been drained, silently dropping them from
+    /// `attribute_event`'s filtering on the next read.
     fn read_events_filtered(
         &self,
         active_launches: &Mutex<HashMap<i32, ActiveLaunch>>,
-    ) -> Vec<(u64, i32, PathBuf, i64)> {
-        let mut buf = [0u8; 4096];
+    ) -> (Vec<(u64, i32, PathBuf, i64)>, bool) {
+        let mut buf = [0u8; 65536];
         let mut events = Vec::new();
 
         let n = unsafe {
@@ -320,12 +329,13 @@ impl FanotifyMonitor {
             if err.kind() != io::ErrorKind::WouldBlock {
                 log::warn!("fanotify (shared): read() failed: {}", err);
             }
-            return events;
+            return (events, false);
         }
         if n == 0 {
-            return events;
+            return (events, false);
         }
         let n = n as usize;
+        let buffer_was_full = n == buf.len();
 
         let mut offset = 0usize;
         while offset + std::mem::size_of::<FanotifyEventMetadata>() <= n {
@@ -385,7 +395,7 @@ impl FanotifyMonitor {
             offset = event_end;
         }
 
-        events
+        (events, buffer_was_full)
     }
 
     /// Read events from the fanotify fd, returning (mask, pid, resolved path) tuples.
@@ -617,7 +627,7 @@ impl FanotifyMonitor {
         log::info!("Shared mutation-capture group running");
 
         loop {
-            let events = self.read_events_filtered(&active_launches);
+            let (events, buffer_was_full) = self.read_events_filtered(&active_launches);
             for (mask, pid, path, txid) in events {
                 if is_excluded_fanotify(&path) {
                     continue;
@@ -641,7 +651,14 @@ impl FanotifyMonitor {
                 let _ = mutation_tx.send(record).await;
             }
 
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            // A full buffer means the kernel very likely still has more
+            // queued — keep draining immediately instead of waiting out the
+            // normal poll interval, so a launch's pid isn't pruned from
+            // active_launches (on process exit) before its own backlog of
+            // already-generated events has actually been read.
+            if !buffer_was_full {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
         }
     }
 }
