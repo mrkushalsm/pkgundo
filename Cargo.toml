@@ -1,0 +1,71 @@
+[package]
+name = "pkgundo"
+version = "0.1.0"
+edition = "2021"
+description = "Universal Linux transaction monitor, mutation provenance engine, and intelligent rollback system"
+authors = ["pkgundo contributors"]
+license = "MIT"
+
+[[bin]]
+name = "pkgundo"
+path = "src/main.rs"
+
+[lib]
+name = "pkgundo"
+path = "src/lib.rs"
+
+[dev-dependencies]
+tempfile = "3"
+
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# SQLite database
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Cryptographic hashing
+sha2 = "0.10"
+hex = "0.4"
+
+# Filesystem watching (inotify backend on Linux)
+notify = "6"
+
+# System-level interfaces
+nix = { version = "0.29", features = ["fs", "process", "signal"] }
+
+# File walking
+walkdir = "2"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Terminal output
+colored = "2"
+
+# Cross-platform process info
+procfs = "0.17"
+
+# libc for system calls (geteuid, etc.)
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
