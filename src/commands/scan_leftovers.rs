@@ -6,7 +6,7 @@ use std::path::Path;
 
 use crate::archive::ArchiveManager;
 use crate::db;
-use crate::scan_leftovers::{self, Confidence};
+use crate::scan_leftovers;
 use crate::transaction;
 
 /// Handle `pkgundo scan-leftovers <app> [--dry-run]`
