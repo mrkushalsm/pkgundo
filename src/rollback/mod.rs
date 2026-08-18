@@ -392,6 +392,17 @@ impl RollbackEngine {
             // remove. Otherwise (regular install rollback), preserve the
             // existing conservative behavior of leaving it alone entirely.
             if self.home_cleanup {
+                // A "modify" mutation can outlive its own path: e.g. an app
+                // writes to a temp file (create + modify), then atomically
+                // renames it into place (rename_to) — by rollback time the
+                // temp path is long gone. Check existence first, exactly
+                // like handle_created_file does, so a stale reference gets
+                // reported as Skipped instead of a phantom "Archived" that
+                // corresponds to no actual archive or removal on disk.
+                if !path.exists() && !path.is_symlink() {
+                    log::debug!("Rollback skip (modified file already gone): {}", path_str);
+                    return Ok(FileRollbackResult::Skipped(path_str));
+                }
                 if !self.dry_run {
                     if path.is_symlink() || path.is_file() {
                         archive_mgr.archive_file(conn, self.txid, &path_str, false)?;
