@@ -71,6 +71,10 @@ pub trait PackageMetadataSource {
     /// referenced by a package's file list). Real impl just reads from disk;
     /// tests can supply canned content instead.
     fn read_file(&self, path: &str) -> Option<String>;
+    /// Read a file's contents straight out of a cached archive, for the
+    /// already-uninstalled case where the live path no longer exists on
+    /// disk. `rel_path` is archive-relative (no leading `/`).
+    fn read_file_in_archive(&self, archive: &Path, rel_path: &str) -> Option<String>;
 }
 
 pub struct PacmanMetadataSource;
@@ -136,6 +140,15 @@ impl PackageMetadataSource for PacmanMetadataSource {
     fn read_file(&self, path: &str) -> Option<String> {
         fs::read_to_string(path).ok()
     }
+
+    fn read_file_in_archive(&self, archive: &Path, rel_path: &str) -> Option<String> {
+        let out = Command::new("bsdtar").args(["-xOf", archive.to_str()?, rel_path]).output().ok()?;
+        if out.status.success() {
+            Some(String::from_utf8_lossy(&out.stdout).to_string())
+        } else {
+            None
+        }
+    }
 }
 
 /// Parse a pacman cache filename (`<name>-<version>-<pkgrel>-<arch>.pkg.tar.<ext>`)
@@ -197,12 +210,23 @@ fn vendor_token_from_url(url: &str) -> Option<String> {
 
 /// `file_list` is expected to already be bare absolute paths, one per line
 /// (no leading `<pkg> ` prefix as `pacman -Ql` uses) — call sites normalize.
+/// `archive` is `Some` when the package is already uninstalled: the live
+/// paths in `file_list` no longer exist on disk, so referenced files
+/// (`.desktop`/`.metainfo.xml` content) must be read straight out of the
+/// cached archive instead.
 fn collect_desktop_and_appstream_tokens(
     source: &dyn PackageMetadataSource,
     file_list: &str,
+    archive: Option<&Path>,
     tokens: &mut HashSet<String>,
     binaries: &mut HashSet<String>,
 ) {
+    let read = |path: &str| -> Option<String> {
+        match archive {
+            Some(a) => source.read_file_in_archive(a, path.trim_start_matches('/')),
+            None => source.read_file(path),
+        }
+    };
     for line in file_list.lines() {
         let path = line.trim();
         if path.ends_with('/') || path.is_empty() {
@@ -212,7 +236,7 @@ fn collect_desktop_and_appstream_tokens(
             if let Some(basename) = Path::new(path).file_stem().and_then(|s| s.to_str()) {
                 tokens.insert(basename.to_lowercase());
             }
-            if let Some(content) = source.read_file(path) {
+            if let Some(content) = read(path) {
                 for line in content.lines() {
                     if let Some(v) = line.strip_prefix("StartupWMClass=") {
                         tokens.insert(v.trim().to_lowercase());
@@ -227,14 +251,21 @@ fn collect_desktop_and_appstream_tokens(
                 }
             }
         } else if path.ends_with(".metainfo.xml") || path.ends_with(".appdata.xml") {
-            if let Some(content) = source.read_file(path) {
+            if let Some(content) = read(path) {
                 if let Some(start) = content.find("<id>") {
                     if let Some(end) = content[start..].find("</id>") {
                         let id = &content[start + 4..start + end];
-                        // AppStream IDs are often reverse-DNS (org.mozilla.firefox);
-                        // take the last dotted segment as the meaningful token.
-                        if let Some(last) = id.trim().split('.').next_back() {
-                            tokens.insert(last.to_lowercase());
+                        // AppStream IDs are typically reverse-DNS
+                        // (org.mozilla.firefox). The *vendor* token that
+                        // resolves naming mismatches (firefox -> mozilla)
+                        // usually sits in a middle segment, not the last
+                        // one (which is often just the product name again,
+                        // already covered by the package-name signal) — so
+                        // every segment goes in, not just the last.
+                        for part in id.trim().split('.') {
+                            if !part.is_empty() {
+                                tokens.insert(part.to_lowercase());
+                            }
                         }
                     }
                 }
@@ -271,6 +302,7 @@ fn derive_signals(app: &str, source: &dyn PackageMetadataSource) -> Signals {
             collect_desktop_and_appstream_tokens(
                 source,
                 &bare_paths.join("\n"),
+                None,
                 &mut signals.structural,
                 &mut extra_bins,
             );
@@ -302,6 +334,7 @@ fn derive_signals(app: &str, source: &dyn PackageMetadataSource) -> Signals {
             collect_desktop_and_appstream_tokens(
                 source,
                 &abs_paths.join("\n"),
+                Some(&archive),
                 &mut signals.structural,
                 &mut extra_bins,
             );
@@ -409,10 +442,29 @@ pub fn scan_leftovers(app: &str) -> Result<Vec<LeftoverCandidate>> {
     scan_with_home(app, None, &PacmanMetadataSource)
 }
 
+/// Resolve the real invoking user's home directory `getent`-style, even
+/// when run under `sudo`. Real (non-dry-run) removal needs root — it writes
+/// to root-owned `/var/lib/pkgundo` — but `sudo` resets `$HOME` to root's
+/// (`/root`), which would silently scan the wrong home entirely. When
+/// `SUDO_USER` is set, resolve *that* user's home instead of trusting `$HOME`.
 fn dirs_home() -> Result<PathBuf> {
+    if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+        if let Some(home) = home_dir_for_user(&sudo_user) {
+            return Ok(home);
+        }
+    }
     std::env::var("HOME")
         .map(PathBuf::from)
         .map_err(|_| anyhow::anyhow!("HOME environment variable is not set"))
+}
+
+fn home_dir_for_user(user: &str) -> Option<PathBuf> {
+    let out = Command::new("getent").args(["passwd", user]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&out.stdout);
+    line.trim().split(':').nth(5).map(PathBuf::from)
 }
 
 #[cfg(test)]
@@ -444,6 +496,9 @@ mod tests {
         }
         fn read_file(&self, path: &str) -> Option<String> {
             self.file_contents.get(path).cloned()
+        }
+        fn read_file_in_archive(&self, _archive: &Path, rel_path: &str) -> Option<String> {
+            self.file_contents.get(&format!("/{}", rel_path)).cloned()
         }
     }
 
@@ -494,12 +549,63 @@ mod tests {
             fn read_file(&self, _path: &str) -> Option<String> {
                 None
             }
+            fn read_file_in_archive(&self, _archive: &Path, _rel_path: &str) -> Option<String> {
+                None
+            }
         }
 
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir(tmp.path().join(".mozilla")).unwrap();
         let candidates = scan_with_home("firefox", Some(tmp.path()), &CachedOnly).unwrap();
         assert!(candidates.iter().any(|c| c.path.ends_with(".mozilla")));
+    }
+
+    /// Reproduces a real-world case found via live VM testing: current
+    /// Firefox packaging's `URL` field points at firefox.com (post-rebrand),
+    /// so the vendor-token-from-URL heuristic finds nothing linking
+    /// "firefox" to "mozilla" — but the package's AppStream metainfo ID
+    /// (org.mozilla.firefox) still does, and once uninstalled that file
+    /// must be read out of the cached archive, not off live disk.
+    #[test]
+    fn appstream_mid_segment_resolves_vendor_when_url_has_no_hint() {
+        struct RebrandedUrlCachedSource;
+        impl PackageMetadataSource for RebrandedUrlCachedSource {
+            fn query_info(&self, _app: &str) -> Option<String> {
+                None
+            }
+            fn query_files(&self, _app: &str) -> Option<String> {
+                None
+            }
+            fn cached_archive(&self, app: &str) -> Option<PathBuf> {
+                Some(PathBuf::from(format!("/fake/{}-153.0.4-1-x86_64.pkg.tar.zst", app)))
+            }
+            fn archive_pkginfo(&self, _archive: &Path) -> Option<String> {
+                Some("pkgname = firefox\nurl = https://www.firefox.com/\n".to_string())
+            }
+            fn archive_file_list(&self, _archive: &Path) -> Option<String> {
+                Some("usr/share/metainfo/org.mozilla.firefox.metainfo.xml\n".to_string())
+            }
+            fn read_file(&self, _path: &str) -> Option<String> {
+                None // live disk copy is gone; must come from the archive
+            }
+            fn read_file_in_archive(&self, _archive: &Path, rel_path: &str) -> Option<String> {
+                if rel_path == "usr/share/metainfo/org.mozilla.firefox.metainfo.xml" {
+                    Some("<id>org.mozilla.firefox</id>".to_string())
+                } else {
+                    None
+                }
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join(".mozilla")).unwrap();
+        let candidates = scan_with_home("firefox", Some(tmp.path()), &RebrandedUrlCachedSource).unwrap();
+        assert!(
+            candidates.iter().any(|c| c.path.ends_with(".mozilla") && c.confidence == Confidence::Exact),
+            "expected the AppStream ID's mid segment ('mozilla') to resolve the naming mismatch even though \
+             the URL field no longer hints at it, got: {:?}",
+            candidates
+        );
     }
 
     #[test]
