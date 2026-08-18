@@ -4,6 +4,7 @@ pub mod archive;
 pub mod blob_store;
 pub mod classifier;
 pub mod cli;
+pub mod daemon;
 pub mod db;
 pub mod ebpf;
 pub mod fingerprint;

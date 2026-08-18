@@ -3,6 +3,7 @@ mod blob_store;
 mod classifier;
 mod cli;
 mod commands;
+mod daemon;
 mod db;
 mod ebpf;
 mod fingerprint;
