@@ -255,11 +255,11 @@ impl RollbackEngine {
         // into touching $HOME (tracked-app cleanup) via `home_cleanup`.
         match action {
             RollbackAction::NeverTouch if !self.home_cleanup => {
-                log::info!("SKIPTAG:nevertouch {}", path_str);
+                log::debug!("Rollback skip (never-touch, user data): {}", path_str);
                 return Ok(FileRollbackResult::Skipped(path_str.to_string()));
             }
             RollbackAction::Skip => {
-                log::info!("SKIPTAG:category-skip {}", path_str);
+                log::debug!("Rollback skip (category policy): {}", path_str);
                 return Ok(FileRollbackResult::Skipped(path_str.to_string()));
             }
             _ => {}
@@ -277,11 +277,11 @@ impl RollbackEngine {
             // The source path of a rename no longer has anything at it —
             // nothing to restore there.
             "rename_from" | "rename" => {
-                log::info!("SKIPTAG:rename-from {}", path_str);
+                log::debug!("Rollback skip (rename source, nothing to restore): {}", path_str);
                 Ok(FileRollbackResult::Skipped(path_str.to_string()))
             }
             _ => {
-                log::info!("SKIPTAG:unknown-op op={} {}", operation, path_str);
+                log::debug!("Rollback skip (unknown operation {}): {}", operation, path_str);
                 Ok(FileRollbackResult::Skipped(path_str.to_string()))
             }
         }
@@ -297,7 +297,7 @@ impl RollbackEngine {
         let path_str = path.to_string_lossy().to_string();
 
         if !path.exists() && !path.is_symlink() {
-            log::info!("SKIPTAG:created-already-gone {}", path_str);
+            log::debug!("Rollback skip (created file already gone): {}", path_str);
             return Ok(FileRollbackResult::Skipped(path_str));
         }
 
@@ -364,7 +364,7 @@ impl RollbackEngine {
                 }
             }
             FingerprintDiff::Missing => {
-                log::info!("SKIPTAG:created-fp-missing {}", path_str);
+                log::debug!("Rollback skip (created file fingerprint missing): {}", path_str);
                 Ok(FileRollbackResult::Skipped(path_str))
             }
         }
@@ -402,7 +402,7 @@ impl RollbackEngine {
                 }
                 return Ok(FileRollbackResult::Archived(path_str));
             }
-            log::info!("SKIPTAG:modify-no-baseline {}", path_str);
+            log::debug!("Rollback skip (modified file has no pre-install baseline): {}", path_str);
             return Ok(FileRollbackResult::Skipped(path_str.to_string()));
         };
 
@@ -439,11 +439,11 @@ impl RollbackEngine {
                 }
             }
             FingerprintDiff::Missing => {
-                log::info!("SKIPTAG:modify-fp-missing {}", path_str);
+                log::debug!("Rollback skip (modified file fingerprint missing): {}", path_str);
                 Ok(FileRollbackResult::Skipped(path_str.to_string()))
             }
             FingerprintDiff::New => {
-                log::info!("SKIPTAG:modify-fp-new {}", path_str);
+                log::debug!("Rollback skip (modified file fingerprint unexpectedly new): {}", path_str);
                 Ok(FileRollbackResult::Skipped(path_str.to_string()))
             }
         }
@@ -472,7 +472,7 @@ impl RollbackEngine {
             );
             return Ok(FileRollbackResult::Restored(path_str.to_string()));
         }
-        log::info!("SKIPTAG:deleted-no-baseline {}", path_str);
+        log::debug!("Rollback skip (deleted file has no pre-install baseline): {}", path_str);
         Ok(FileRollbackResult::Skipped(path_str.to_string()))
     }
 
