@@ -53,6 +53,28 @@ pub async fn run_daemon(db_path: &str) -> Result<()> {
     let conn = crate::db::init_db(db_path).context("Failed to initialize database")?;
     let conn = Arc::new(Mutex::new(conn));
 
+    // The daemon holds this connection open for its entire life, so
+    // SQLite's normal "checkpoint the WAL on last connection close" trigger
+    // never fires. Without periodically checkpointing ourselves, committed
+    // data would sit in `pkgundo.db-wal` indefinitely — invisible to every
+    // CLI-side readonly command (`inspect`, `timeline`, `status`,
+    // `untrack --rollback`'s `load_tracked_app`), which open the db with
+    // `immutable=1` and therefore skip the WAL entirely (they can't get
+    // write access to `-shm` to join it like a normal reader would).
+    {
+        let conn = Arc::clone(&conn);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                let guard = conn.lock().await;
+                if let Err(e) = guard.execute_batch("PRAGMA wal_checkpoint(PASSIVE);") {
+                    log::debug!("daemon: WAL checkpoint failed: {}", e);
+                }
+            }
+        });
+    }
+
     // Exec-watching setup. `ExecWatch::load_from_db` can fail (e.g. a
     // pre-5.0 kernel without FAN_OPEN_EXEC) — that's graceful degradation,
     // not a startup failure: every DB-backed feature keeps working, only
