@@ -233,6 +233,15 @@ impl Drop for ExecWatch {
     }
 }
 
+/// System accounts (e.g. `nobody`) commonly have a passwd home of `/` — a
+/// resolved, valid-looking answer, not a lookup failure, but arming a
+/// filesystem-wide mark scoped to "/" would defeat the entire point of
+/// per-launch $HOME scoping (every path on the filesystem satisfies
+/// `path.starts_with("/")`). Reject it the same as an unresolvable home.
+fn is_usable_home(path: &std::path::Path) -> bool {
+    path != std::path::Path::new("/")
+}
+
 fn read_real_uid(pid: i32) -> Option<u32> {
     let status = std::fs::read_to_string(format!("/proc/{}/status", pid)).ok()?;
     for line in status.lines() {
@@ -257,10 +266,10 @@ async fn spawn_launch(
             return;
         }
     };
-    let home = match crate::scan_leftovers::home_dir_for_uid(uid) {
+    let home = match crate::scan_leftovers::home_dir_for_uid(uid).filter(|h| is_usable_home(h)) {
         Some(h) => h,
         None => {
-            log::warn!("exec-watch: couldn't resolve home dir for uid {}, skipping launch", uid);
+            log::warn!("exec-watch: uid {} has no usable home dir (got '/' or none), skipping launch", uid);
             return;
         }
     };
@@ -304,4 +313,21 @@ async fn spawn_launch(
         }
     }
     mutation_capture.stop(&home);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn rejects_root_as_a_home_dir() {
+        assert!(!is_usable_home(Path::new("/")));
+    }
+
+    #[test]
+    fn accepts_a_real_home_dir() {
+        assert!(is_usable_home(Path::new("/home/alice")));
+        assert!(is_usable_home(Path::new("/root")));
+    }
 }
