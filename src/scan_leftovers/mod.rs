@@ -467,12 +467,26 @@ fn home_dir_for_user(user: &str) -> Option<PathBuf> {
     line.trim().split(':').nth(5).map(PathBuf::from)
 }
 
-/// Resolve a uid to its home directory, for the daemon's exec-watch path
-/// (a launching process's real uid, not a username). `getent passwd` accepts
-/// a numeric uid exactly like a username, so this just reuses the same
-/// lookup+field-split as `home_dir_for_user`.
+/// Resolve a uid to its home directory, for the daemon's exec-watch path (a
+/// launching process's real uid, not a username). Deliberately an in-process
+/// `getpwuid_r` lookup rather than shelling out to `getent` like
+/// `home_dir_for_user` does: this runs on the race-sensitive path between
+/// detecting an exec and arming that filesystem's mutation-capture mark
+/// (see `daemon::exec_watch`), where a fork+exec of a whole subprocess was
+/// measurably widening the window in which a fast-starting app's first
+/// writes could be missed.
 pub(crate) fn home_dir_for_uid(uid: u32) -> Option<PathBuf> {
-    home_dir_for_user(&uid.to_string())
+    let mut buf = vec![0u8; 4096];
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let ret = unsafe {
+        libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr() as *mut libc::c_char, buf.len(), &mut result)
+    };
+    if ret != 0 || result.is_null() || pwd.pw_dir.is_null() {
+        return None;
+    }
+    let home = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) }.to_str().ok()?;
+    Some(PathBuf::from(home))
 }
 
 #[cfg(test)]
