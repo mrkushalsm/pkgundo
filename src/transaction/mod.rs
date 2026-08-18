@@ -10,6 +10,13 @@ pub enum TransactionStatus {
     Completed,
     Failed,
     RolledBack,
+    /// A long-lived accumulation bucket for a tracked app's mutations across
+    /// many separate launches, left open (end_time NULL) until untracked.
+    Tracking,
+    /// Terminal state for a tracked app's bucket transaction once untracked.
+    /// Distinct from RolledBack: untracking doesn't necessarily mean any
+    /// mutation was actually reversed yet.
+    Untracked,
 }
 
 impl TransactionStatus {
@@ -19,6 +26,8 @@ impl TransactionStatus {
             TransactionStatus::Completed => "completed",
             TransactionStatus::Failed => "failed",
             TransactionStatus::RolledBack => "rolled_back",
+            TransactionStatus::Tracking => "tracking",
+            TransactionStatus::Untracked => "untracked",
         }
     }
 
@@ -28,6 +37,8 @@ impl TransactionStatus {
             "completed" => TransactionStatus::Completed,
             "failed" => TransactionStatus::Failed,
             "rolled_back" => TransactionStatus::RolledBack,
+            "tracking" => TransactionStatus::Tracking,
+            "untracked" => TransactionStatus::Untracked,
             _ => TransactionStatus::Failed,
         }
     }

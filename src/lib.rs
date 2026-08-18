@@ -13,5 +13,6 @@ pub mod journal;
 pub mod process_tracker;
 pub mod rollback;
 pub mod service_tracker;
+pub mod tracked_apps;
 pub mod transaction;
 pub mod user_tracker;

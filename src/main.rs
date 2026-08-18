@@ -12,6 +12,7 @@ mod journal;
 mod process_tracker;
 mod rollback;
 mod service_tracker;
+mod tracked_apps;
 mod transaction;
 mod user_tracker;
 

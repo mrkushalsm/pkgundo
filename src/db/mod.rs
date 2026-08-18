@@ -180,6 +180,26 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
     )
     .context("Failed to create user_snapshots table")?;
 
+    // ── Tracked apps table (persistent, cross-session; NOT scoped to one
+    // invocation — represents an app being watched across its whole
+    // install→usage→uninstall life, independent of any single command) ─────
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS tracked_apps (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            name            TEXT NOT NULL,                      -- user-given identifier, e.g. \"firefox\"
+            kind            TEXT NOT NULL,                       -- 'package' | 'binary'
+            package_name    TEXT,                                -- resolved pacman package, if kind='package'
+            resolved_paths  TEXT NOT NULL,                       -- JSON array of absolute binary paths
+            status          TEXT NOT NULL DEFAULT 'tracking',    -- 'tracking' | 'untracked'
+            txid            INTEGER REFERENCES transactions(txid),
+            created_at      TEXT NOT NULL,
+            untracked_at    TEXT,
+            UNIQUE(name)
+        );
+        CREATE INDEX IF NOT EXISTS idx_tracked_apps_status ON tracked_apps(status);",
+    )
+    .context("Failed to create tracked_apps table")?;
+
     log::debug!("Database initialized at {}", db_path);
     Ok(conn)
 }
