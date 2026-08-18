@@ -13,10 +13,12 @@
 
 use anyhow::Result;
 use chrono::Utc;
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 use crate::classifier::classify_path;
@@ -33,6 +35,7 @@ const FAN_MOVED_FROM: u64 = 0x0000_0040;
 const FAN_MOVED_TO: u64 = 0x0000_0080;
 
 const FAN_MARK_ADD: u32 = 0x0000_0001;
+const FAN_MARK_REMOVE: u32 = 0x0000_0002;
 // FAN_MARK_MOUNT explicitly forbids FAN_CREATE/FAN_DELETE/FAN_MOVE* in its
 // mask — file-handle-identified events "cannot be provided as a mask when
 // flags contains FAN_MARK_MOUNT" (`man fanotify_mark`, FAN_MARK_MOUNT
@@ -143,6 +146,47 @@ fn check_ebpf_support() -> bool {
             .unwrap_or(false)
 }
 
+/// A currently-running tracked-app launch, registered in the shared map
+/// `run_shared` consults to decide whether/how to record an event. `home` is
+/// the launching user's home directory (the scoping filter); `mount_fd` is
+/// an fd open on that same path, needed because `open_by_handle_at(2)`
+/// requires an fd on the *same filesystem* as the object being resolved —
+/// with marks potentially spanning multiple distinct filesystems (e.g. a
+/// separate `/home` partition), a single hardcoded mount fd can't correctly
+/// resolve handles for all of them, so each launch carries its own.
+pub struct ActiveLaunch {
+    pub txid: i64,
+    pub home: PathBuf,
+    mount_fd: RawFd,
+}
+
+impl ActiveLaunch {
+    /// Opens `mount_fd` on `home` itself. Returns `None` if `home` can't be
+    /// opened (race: directory doesn't exist yet, permissions, etc.) — the
+    /// caller should skip registering this launch rather than panic.
+    pub fn new(txid: i64, home: PathBuf) -> Option<Self> {
+        let c_home = std::ffi::CString::new(home.to_string_lossy().as_bytes()).ok()?;
+        let fd = unsafe { libc::open(c_home.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            log::warn!(
+                "ActiveLaunch: failed to open {} for handle resolution: {}",
+                home.display(),
+                io::Error::last_os_error()
+            );
+            return None;
+        }
+        Some(Self { txid, home, mount_fd: fd })
+    }
+}
+
+impl Drop for ActiveLaunch {
+    fn drop(&mut self) {
+        if self.mount_fd >= 0 {
+            unsafe { libc::close(self.mount_fd) };
+        }
+    }
+}
+
 /// fanotify-based filesystem monitor that provides PID attribution per event.
 /// Falls back to a no-op if fanotify is not available.
 pub struct FanotifyMonitor {
@@ -209,6 +253,139 @@ impl FanotifyMonitor {
             }
         }
         Ok(())
+    }
+
+    /// Add or remove a single `FAN_MARK_FILESYSTEM` mark — used by
+    /// `MutationCapture` to dynamically arm/disarm coverage of a launch's
+    /// home filesystem while this group's `run_shared` loop is concurrently
+    /// reading events from the same fd. Adding/removing marks and reading
+    /// are independent syscalls on the same fd; the kernel handles this
+    /// concurrency fine.
+    pub fn mark_filesystem(&self, path: &str, add: bool) -> Result<()> {
+        let mask = FAN_CLOSE_WRITE | FAN_CREATE | FAN_DELETE | FAN_MOVED_FROM | FAN_MOVED_TO;
+        let flags = if add {
+            FAN_MARK_ADD | FAN_MARK_FILESYSTEM
+        } else {
+            FAN_MARK_REMOVE | FAN_MARK_FILESYSTEM
+        };
+        let c_path = std::ffi::CString::new(path)
+            .map_err(|e| anyhow::anyhow!("path {} has an embedded NUL: {}", path, e))?;
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_fanotify_mark,
+                self.fanotify_fd as i64,
+                flags as i64,
+                mask as i64,
+                AT_FDCWD as i64,
+                c_path.as_ptr(),
+            )
+        };
+        if ret < 0 {
+            return Err(anyhow::anyhow!(
+                "fanotify_mark ({}) failed for {}: {}",
+                if add { "add" } else { "remove" },
+                path,
+                io::Error::last_os_error()
+            ));
+        }
+        log::info!(
+            "fanotify: {} filesystem mark for {}",
+            if add { "armed" } else { "disarmed" },
+            path
+        );
+        Ok(())
+    }
+
+    /// Like `read_events`, but for the shared mutation-capture group: looks
+    /// up each event's pid in `active_launches` *before* doing any handle
+    /// resolution — most events on a whole-filesystem mark belong to
+    /// unrelated processes, so this both scopes correctness (using the
+    /// matched launch's own `mount_fd`, since marks may span multiple
+    /// distinct filesystems) and skips the resolve work entirely for
+    /// everything else. Returns (mask, pid, resolved path, txid) tuples,
+    /// already filtered to paths under the matched launch's home dir.
+    fn read_events_filtered(
+        &self,
+        active_launches: &Mutex<HashMap<i32, ActiveLaunch>>,
+    ) -> Vec<(u64, i32, PathBuf, i64)> {
+        let mut buf = [0u8; 4096];
+        let mut events = Vec::new();
+
+        let n = unsafe {
+            libc::read(self.fanotify_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+        };
+
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::WouldBlock {
+                log::warn!("fanotify (shared): read() failed: {}", err);
+            }
+            return events;
+        }
+        if n == 0 {
+            return events;
+        }
+        let n = n as usize;
+
+        let mut offset = 0usize;
+        while offset + std::mem::size_of::<FanotifyEventMetadata>() <= n {
+            let meta = unsafe {
+                std::ptr::read(buf.as_ptr().add(offset) as *const FanotifyEventMetadata)
+            };
+
+            if meta.vers != FANOTIFY_METADATA_VERSION || meta.event_len == 0 {
+                break;
+            }
+
+            let event_end = offset + meta.event_len as usize;
+            if event_end > n {
+                break;
+            }
+
+            // Cheap check first: is this pid one we actually care about?
+            // Skips handle resolution entirely for the overwhelming majority
+            // of events on a whole-filesystem mark.
+            let mount_fd = {
+                let guard = active_launches.lock().unwrap_or_else(|p| p.into_inner());
+                guard.get(&meta.pid).map(|l| l.mount_fd)
+            };
+            if let Some(mount_fd) = mount_fd {
+                let mut info_offset = offset + meta.metadata_len as usize;
+                let mut path = None;
+                while info_offset + 4 <= event_end {
+                    let info_type = buf[info_offset];
+                    let info_len =
+                        u16::from_ne_bytes([buf[info_offset + 2], buf[info_offset + 3]]) as usize;
+                    if info_len == 0 || info_offset + info_len > event_end {
+                        break;
+                    }
+                    if info_type == FAN_EVENT_INFO_TYPE_DFID_NAME {
+                        path = Self::resolve_dfid_name(mount_fd, &buf, info_offset, info_len);
+                    }
+                    info_offset += info_len;
+                }
+
+                if let Some(p) = path {
+                    // Re-check (not just reuse the earlier lookup) since the
+                    // launch could theoretically have been deregistered while
+                    // we were resolving — attribute_event() re-deriving the
+                    // decision from current state is the safe default: an
+                    // event from a launch that just ended is correctly dropped.
+                    let guard = active_launches.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Some(txid) = attribute_event(meta.pid, &p, &guard) {
+                        events.push((meta.mask, meta.pid, p, txid));
+                    }
+                }
+            }
+
+            if meta.fd != FAN_NOFD {
+                unsafe { libc::close(meta.fd) };
+            }
+
+            offset = event_end;
+        }
+
+        events
     }
 
     /// Read events from the fanotify fd, returning (mask, pid, resolved path) tuples.
@@ -424,6 +601,49 @@ impl FanotifyMonitor {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
+
+    /// The shared mutation-capture counterpart to `run()`: no fixed watch
+    /// list up front (marks are armed/disarmed dynamically by
+    /// `MutationCapture` via `mark_filesystem` while this loop runs), and
+    /// every event is attributed against `active_launches` (pid → txid/home)
+    /// instead of a single hardcoded txid. Takes `Arc<Self>` rather than
+    /// consuming `self`, since `MutationCapture` needs to keep calling
+    /// `mark_filesystem` on the same group concurrently with this loop.
+    pub async fn run_shared(
+        self: Arc<Self>,
+        mutation_tx: mpsc::Sender<MutationRecord>,
+        active_launches: Arc<Mutex<HashMap<i32, ActiveLaunch>>>,
+    ) {
+        log::info!("Shared mutation-capture group running");
+
+        loop {
+            let events = self.read_events_filtered(&active_launches);
+            for (mask, pid, path, txid) in events {
+                if is_excluded_fanotify(&path) {
+                    continue;
+                }
+
+                let operation = mask_to_operation(mask);
+                let category = classify_path(&path);
+
+                let record = MutationRecord {
+                    id: None,
+                    txid,
+                    pid: Some(pid),
+                    operation: operation.to_string(),
+                    path: path.to_string_lossy().to_string(),
+                    timestamp: Utc::now(),
+                    file_category: format!("{}", category),
+                    pre_hash: None,
+                    post_hash: None,
+                };
+
+                let _ = mutation_tx.send(record).await;
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
 }
 
 impl Drop for FanotifyMonitor {
@@ -461,6 +681,73 @@ fn is_excluded_fanotify(path: &std::path::Path) -> bool {
         || s.starts_with("/dev")
         || s.starts_with("/run/user")
         || s.starts_with("/var/lib/pkgundo")
+}
+
+/// Given an already-resolved event `(pid, path)`, decide whether it belongs
+/// to a currently-active tracked-app launch and if so which txid to record
+/// it against. `path.starts_with` is component-aware (not a string-prefix
+/// compare), so e.g. `/home/alice` vs `/home/alice-backup` can't false-match.
+/// Pure and side-effect-free — decoupled from the actual (root-only)
+/// fanotify read/resolve mechanics so it's unit-testable on its own.
+fn attribute_event(pid: i32, path: &std::path::Path, active_launches: &HashMap<i32, ActiveLaunch>) -> Option<i64> {
+    let launch = active_launches.get(&pid)?;
+    if path.starts_with(&launch.home) {
+        Some(launch.txid)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn launch(txid: i64, home: &str) -> ActiveLaunch {
+        // Any real, existing path works — ActiveLaunch::new just opens an fd
+        // on it for later open_by_handle_at use, which these tests never
+        // reach (attribute_event is pure path/map logic).
+        ActiveLaunch::new(txid, PathBuf::from(home)).expect("home dir must exist for this test")
+    }
+
+    #[test]
+    fn matches_pid_and_path_under_home() {
+        let mut map = HashMap::new();
+        map.insert(42, launch(7, "/tmp"));
+        assert_eq!(attribute_event(42, Path::new("/tmp/app/config.json"), &map), Some(7));
+    }
+
+    #[test]
+    fn drops_event_for_unregistered_pid() {
+        let mut map = HashMap::new();
+        map.insert(42, launch(7, "/tmp"));
+        assert_eq!(attribute_event(99, Path::new("/tmp/app/config.json"), &map), None);
+    }
+
+    #[test]
+    fn drops_event_outside_registered_home() {
+        // ActiveLaunch::new needs a real, existing path (it opens an fd on
+        // it), so use real sibling tempdirs to exercise the exact
+        // alice / alice-backup false-positive this check guards against.
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = tmp.path().join("alice");
+        let alice_backup = tmp.path().join("alice-backup");
+        std::fs::create_dir(&alice).unwrap();
+        std::fs::create_dir(&alice_backup).unwrap();
+
+        let mut map = HashMap::new();
+        map.insert(42, ActiveLaunch::new(7, alice).unwrap());
+        // Component-aware starts_with must not treat "alice-backup" as
+        // being under "alice".
+        assert_eq!(attribute_event(42, &alice_backup.join("file"), &map), None);
+    }
+
+    #[test]
+    fn matches_home_itself_not_only_children() {
+        let mut map = HashMap::new();
+        map.insert(42, launch(7, "/tmp"));
+        assert_eq!(attribute_event(42, Path::new("/tmp"), &map), Some(7));
+    }
 }
 
 // ── eBPF Infrastructure ─────────────────────────────────────────────────────

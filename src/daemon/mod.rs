@@ -3,22 +3,32 @@
 //! CLI's `track`/`untrack`/`tracked` commands can durably record which apps
 //! are being watched.
 //!
-//! Foundational slice only: the daemon accepts and durably records
-//! track/untrack requests, but does not yet watch anything via fanotify
-//! (FAN_OPEN_EXEC-based exec watching is future work layered on top of this).
+//! Beyond the DB-backed tracking itself, the daemon detects every execution
+//! of a tracked binary (`exec_watch`, a `FAN_OPEN_EXEC` fanotify group) and
+//! captures that launch's `$HOME` mutations into the app's bucket
+//! transaction via a lazily-started/stopped, per-filesystem-refcounted
+//! shared mutation-capture group (`mutation_capture`). If `FAN_OPEN_EXEC`
+//! isn't supported by the running kernel (pre-5.0), exec-watching is
+//! disabled for the daemon's life but every DB-backed feature still works.
 
 pub mod client;
+mod exec_watch;
 pub mod ipc;
+mod mutation_capture;
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
+use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
+use crate::ebpf::ActiveLaunch;
+use exec_watch::ExecWatch;
 use ipc::{Request, Response, TrackedAppView};
+use mutation_capture::MutationCapture;
 
 pub const RUN_DIR: &str = "/run/pkgundo";
 pub const SOCKET_PATH: &str = "/run/pkgundo/daemon.sock";
@@ -43,6 +53,59 @@ pub async fn run_daemon(db_path: &str) -> Result<()> {
     let conn = crate::db::init_db(db_path).context("Failed to initialize database")?;
     let conn = Arc::new(Mutex::new(conn));
 
+    // Exec-watching setup. `ExecWatch::load_from_db` can fail (e.g. a
+    // pre-5.0 kernel without FAN_OPEN_EXEC) — that's graceful degradation,
+    // not a startup failure: every DB-backed feature keeps working, only
+    // live mutation capture is unavailable.
+    let exec_watch: Option<Arc<ExecWatch>> = {
+        let guard = conn.lock().await;
+        match ExecWatch::load_from_db(&guard) {
+            Ok(ew) => Some(Arc::new(ew)),
+            Err(e) => {
+                log::warn!(
+                    "pkgundo daemon: exec-watching disabled ({}). Tracking still works; \
+                     live mutation capture for launches will not.",
+                    e
+                );
+                None
+            }
+        }
+    };
+
+    // One long-lived mutation channel + journal-writing collector task for
+    // the daemon's whole life, decoupled from individual launches/groups
+    // starting and stopping — mirrors `commands/run.rs`'s journal task.
+    let (mutation_tx, mut mutation_rx) = mpsc::channel::<crate::journal::MutationRecord>(4096);
+    let db_path_for_journal = db_path.to_string();
+    tokio::spawn(async move {
+        let conn = match crate::db::open_db(&db_path_for_journal) {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("daemon journal task: DB open failed: {}", e);
+                return;
+            }
+        };
+        while let Some(record) = mutation_rx.recv().await {
+            if let Err(e) = crate::journal::append_mutation(&conn, &record) {
+                log::debug!("daemon journal task: dedup/error: {}", e);
+            }
+        }
+    });
+
+    let active_launches: Arc<StdMutex<HashMap<i32, ActiveLaunch>>> =
+        Arc::new(StdMutex::new(HashMap::new()));
+    let mutation_capture = Arc::new(MutationCapture::new(mutation_tx, Arc::clone(&active_launches)));
+
+    if let Some(ew) = &exec_watch {
+        let ew = Arc::clone(ew);
+        let db_path = db_path.to_string();
+        let active_launches = Arc::clone(&active_launches);
+        let mutation_capture = Arc::clone(&mutation_capture);
+        tokio::spawn(async move {
+            ew.run(db_path, active_launches, mutation_capture).await;
+        });
+    }
+
     log::info!("pkgundo daemon listening on {}", SOCKET_PATH);
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -54,8 +117,9 @@ pub async fn run_daemon(db_path: &str) -> Result<()> {
                 match accepted {
                     Ok((stream, _addr)) => {
                         let conn = Arc::clone(&conn);
+                        let exec_watch = exec_watch.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, conn).await {
+                            if let Err(e) = handle_connection(stream, conn, exec_watch).await {
                                 log::debug!("daemon: connection handler error: {}", e);
                             }
                         });
@@ -81,7 +145,11 @@ pub async fn run_daemon(db_path: &str) -> Result<()> {
     Ok(())
 }
 
-async fn handle_connection(stream: UnixStream, conn: Arc<Mutex<Connection>>) -> Result<()> {
+async fn handle_connection(
+    stream: UnixStream,
+    conn: Arc<Mutex<Connection>>,
+    exec_watch: Option<Arc<ExecWatch>>,
+) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
@@ -97,7 +165,7 @@ async fn handle_connection(stream: UnixStream, conn: Arc<Mutex<Connection>>) -> 
         }
 
         let response = match serde_json::from_str::<Request>(line) {
-            Ok(req) => handle_request(&conn, req).await,
+            Ok(req) => handle_request(&conn, &exec_watch, req).await,
             Err(e) => Response::Error { message: format!("Malformed request: {}", e) },
         };
 
@@ -109,28 +177,44 @@ async fn handle_connection(stream: UnixStream, conn: Arc<Mutex<Connection>>) -> 
     }
 }
 
-async fn handle_request(conn: &Arc<Mutex<Connection>>, req: Request) -> Response {
+async fn handle_request(
+    conn: &Arc<Mutex<Connection>>,
+    exec_watch: &Option<Arc<ExecWatch>>,
+    req: Request,
+) -> Response {
     match req {
         Request::Ping => Response::Pong,
         Request::Track { name } => {
             let conn = conn.lock().await;
             match crate::tracked_apps::track_app(&conn, &name) {
-                Ok(app) => Response::Ok {
-                    message: format!(
-                        "Now tracking '{}' ({}: {}, {} path(s) resolved)",
-                        app.name,
-                        app.kind,
-                        app.package_name.as_deref().unwrap_or("n/a"),
-                        app.resolved_paths.len()
-                    ),
-                },
+                Ok(app) => {
+                    if let Some(ew) = exec_watch {
+                        if let Err(e) = ew.watch_app(&app.name, app.txid, &app.resolved_paths) {
+                            log::warn!("daemon: failed to arm exec-watch marks for '{}': {}", app.name, e);
+                        }
+                    }
+                    Response::Ok {
+                        message: format!(
+                            "Now tracking '{}' ({}: {}, {} path(s) resolved)",
+                            app.name,
+                            app.kind,
+                            app.package_name.as_deref().unwrap_or("n/a"),
+                            app.resolved_paths.len()
+                        ),
+                    }
+                }
                 Err(e) => Response::Error { message: format!("{:#}", e) },
             }
         }
         Request::Untrack { name } => {
             let conn = conn.lock().await;
             match crate::tracked_apps::untrack_app(&conn, &name) {
-                Ok(()) => Response::Ok { message: format!("Stopped tracking '{}'", name) },
+                Ok(()) => {
+                    if let Some(ew) = exec_watch {
+                        ew.unwatch_app(&name);
+                    }
+                    Response::Ok { message: format!("Stopped tracking '{}'", name) }
+                }
                 Err(e) => Response::Error { message: format!("{:#}", e) },
             }
         }
@@ -143,5 +227,38 @@ async fn handle_request(conn: &Arc<Mutex<Connection>>, req: Request) -> Response
                 Err(e) => Response::Error { message: format!("{:#}", e) },
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Can't simulate a real pre-5.0 kernel to test `ExecWatch::try_new()`
+    /// actually failing, but this verifies the thing that actually matters:
+    /// every request the daemon serves keeps working correctly when
+    /// exec-watching is disabled (`exec_watch: None`), not just "doesn't panic".
+    #[tokio::test]
+    async fn handle_request_works_with_exec_watch_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("pkgundo.db");
+        let conn = Arc::new(Mutex::new(crate::db::init_db(db_path.to_str().unwrap()).unwrap()));
+        let exec_watch: Option<Arc<ExecWatch>> = None;
+
+        assert!(matches!(handle_request(&conn, &exec_watch, Request::Ping).await, Response::Pong));
+
+        let resp =
+            handle_request(&conn, &exec_watch, Request::Track { name: "/bin/ls".to_string() }).await;
+        assert!(matches!(resp, Response::Ok { .. }), "expected Ok, got {:?}", resp);
+
+        let resp = handle_request(&conn, &exec_watch, Request::ListTracked { all: false }).await;
+        match resp {
+            Response::TrackedList { apps } => assert_eq!(apps.len(), 1),
+            other => panic!("expected TrackedList, got {:?}", other),
+        }
+
+        let resp =
+            handle_request(&conn, &exec_watch, Request::Untrack { name: "/bin/ls".to_string() }).await;
+        assert!(matches!(resp, Response::Ok { .. }), "expected Ok, got {:?}", resp);
     }
 }
