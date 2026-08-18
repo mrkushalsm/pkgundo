@@ -64,8 +64,8 @@ async fn main() -> Result<()> {
         Commands::Track { app } => {
             commands::track::handle_track(app).await?;
         }
-        Commands::Untrack { app } => {
-            commands::track::handle_untrack(app).await?;
+        Commands::Untrack { app, rollback, mode, dry_run } => {
+            commands::track::handle_untrack(app, *rollback, mode, *dry_run, db_path).await?;
         }
         Commands::Tracked { all } => {
             commands::track::handle_tracked(*all).await?;

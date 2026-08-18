@@ -77,11 +77,25 @@ pub enum Commands {
         app: String,
     },
 
-    /// Stop tracking a previously tracked app.
-    /// Example: pkgundo untrack firefox
+    /// Stop tracking a previously tracked app. With --rollback, also
+    /// removes everything the app is known to have created under $HOME
+    /// since tracking began (requires root; archives before removing).
+    /// Example: pkgundo untrack firefox --rollback
     Untrack {
         /// Package name or binary path/name to stop tracking
         app: String,
+
+        /// Also roll back (archive + remove) the app's accumulated $HOME mutations
+        #[arg(long, default_value = "false")]
+        rollback: bool,
+
+        /// Rollback mode to use if --rollback is passed (conservative|clean|nuclear)
+        #[arg(long, default_value = "conservative")]
+        mode: String,
+
+        /// With --rollback: show what would be removed without acting
+        #[arg(long, default_value = "false")]
+        dry_run: bool,
     },
 
     /// List tracked apps.
