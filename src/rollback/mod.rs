@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use colored::Colorize;
 use rusqlite::Connection;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::archive::ArchiveManager;
@@ -183,6 +183,17 @@ impl RollbackEngine {
                     report.failed.push((path_str.clone(), format!("Error: {}", e)));
                 }
             }
+        }
+
+        // fanotify only reports file events, never directory-creation, so
+        // there's no mutation recorded for the XDG directories an app
+        // creates (e.g. `~/.config/weechat`) — only for the files inside
+        // them. Without this, every home_cleanup rollback leaves a trail of
+        // now-empty directories behind. Bounded at the user's home
+        // directory itself, which is never removed even if empty.
+        if self.home_cleanup && !self.dry_run {
+            let removed_paths: Vec<&String> = report.removed.iter().chain(report.archived.iter()).collect();
+            cleanup_empty_ancestor_dirs(&removed_paths);
         }
 
         // ── STEP F: Service + user reconciliation (Phase 9) ───────────────────
@@ -570,6 +581,68 @@ impl RollbackEngine {
     }
 }
 
+/// Walk up from each removed/archived path's parent directory, removing
+/// directories that are now empty, one level at a time, stopping at (and
+/// never removing) the owning user's home directory.
+fn cleanup_empty_ancestor_dirs(removed_paths: &[&String]) {
+    use std::collections::BTreeSet;
+
+    let mut candidates: BTreeSet<PathBuf> = BTreeSet::new();
+    for p in removed_paths {
+        if let Some(parent) = Path::new(p.as_str()).parent() {
+            candidates.insert(parent.to_path_buf());
+        }
+    }
+
+    for start in candidates {
+        if let Some(home) = home_root_of(&start) {
+            remove_empty_dirs_up_to(start, &home);
+        }
+    }
+}
+
+/// Remove `dir` and each empty ancestor above it, stopping at (and never
+/// removing) `boundary` itself. Split out from `cleanup_empty_ancestor_dirs`
+/// so the tree-walking logic is testable without depending on `/home`
+/// actually existing at the filesystem root the way `home_root_of` assumes.
+fn remove_empty_dirs_up_to(mut dir: PathBuf, boundary: &Path) {
+    loop {
+        if dir == boundary || !dir.starts_with(boundary) {
+            break;
+        }
+        match fs::read_dir(&dir) {
+            Ok(mut entries) => {
+                if entries.next().is_some() {
+                    break; // not empty — leave it alone
+                }
+            }
+            Err(_) => break, // unreadable — leave it alone
+        }
+        if fs::remove_dir(&dir).is_err() {
+            break;
+        }
+        log::debug!("Rollback: removed now-empty directory {}", dir.display());
+        match dir.parent() {
+            Some(parent) => dir = parent.to_path_buf(),
+            None => break,
+        }
+    }
+}
+
+/// The `/home/<user>` or `/root` a path lives under, per the same
+/// convention `home_dir_for_uid` resolves — used only as the removal
+/// boundary above, never to be removed itself.
+fn home_root_of(path: &Path) -> Option<PathBuf> {
+    let mut comps = path.components();
+    comps.next()?; // RootDir
+    let first = comps.next()?;
+    match first.as_os_str().to_str()? {
+        "root" => Some(PathBuf::from("/root")),
+        "home" => Some(Path::new("/home").join(comps.next()?)),
+        _ => None,
+    }
+}
+
 /// Summary of a rollback operation
 #[derive(Debug)]
 pub struct RollbackReport {
@@ -650,5 +723,55 @@ impl RollbackReport {
                 "✗ INCOMPLETE".red().to_string()
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn home_root_of_resolves_home_and_root() {
+        assert_eq!(home_root_of(Path::new("/home/alice/.config/app")), Some(PathBuf::from("/home/alice")));
+        assert_eq!(home_root_of(Path::new("/home/alice")), Some(PathBuf::from("/home/alice")));
+        assert_eq!(home_root_of(Path::new("/root/.config/app")), Some(PathBuf::from("/root")));
+    }
+
+    #[test]
+    fn home_root_of_none_for_system_paths() {
+        assert_eq!(home_root_of(Path::new("/usr/bin/foo")), None);
+        assert_eq!(home_root_of(Path::new("/etc/foo")), None);
+    }
+
+    #[test]
+    fn cleanup_removes_now_empty_nested_dirs_but_stops_at_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("alice");
+        let nested = home.join(".config").join("app").join("sub");
+        fs::create_dir_all(&nested).unwrap();
+
+        remove_empty_dirs_up_to(nested.clone(), &home);
+
+        assert!(!nested.exists(), "empty leaf dir should be removed");
+        assert!(!home.join(".config").join("app").exists(), "empty parent should be removed");
+        assert!(!home.join(".config").exists(), "empty grandparent should be removed");
+        assert!(home.exists(), "home directory itself must never be removed");
+    }
+
+    #[test]
+    fn cleanup_stops_at_first_non_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("alice");
+        let app_dir = home.join(".config").join("app");
+        let sub_dir = app_dir.join("sub");
+        fs::create_dir_all(&sub_dir).unwrap();
+        // A sibling file that was NOT part of this rollback keeps app_dir non-empty.
+        fs::write(app_dir.join("keep.conf"), b"x").unwrap();
+
+        remove_empty_dirs_up_to(sub_dir.clone(), &home);
+
+        assert!(!sub_dir.exists(), "the genuinely empty leaf should still be removed");
+        assert!(app_dir.exists(), "must not remove a directory with other content still in it");
     }
 }
