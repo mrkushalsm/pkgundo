@@ -32,8 +32,12 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Print banner
-    print_banner();
+    // Print banner — except for the pacman hook, whose output lands inline
+    // in someone's `pacman -R` terminal and has no business showing an
+    // ASCII banner there.
+    if !matches!(cli.command, Commands::PacmanHook) {
+        print_banner();
+    }
 
     // Initialize DB (creates schema if not exists)
     // For non-run commands, we use a read-write connection too (for status updates etc.)
@@ -75,6 +79,15 @@ async fn main() -> Result<()> {
         }
         Commands::Daemon => {
             daemon::run_daemon(db_path).await?;
+        }
+        Commands::PacmanHook => {
+            // Contract: this command's exit code is always 0 — see
+            // handle_pacman_hook's doc. Any internal error is caught and
+            // logged there, never propagated up through this `?`.
+            commands::hook::handle_pacman_hook(db_path);
+        }
+        Commands::InstallHook { remove } => {
+            commands::hook::handle_install_hook(*remove)?;
         }
     }
 

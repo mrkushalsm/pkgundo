@@ -1,0 +1,10 @@
+[Trigger]
+Operation = Remove
+Type = Package
+Target = *
+
+[Action]
+Description = pkgundo: checking removed packages for tracked $HOME mutations...
+When = PostTransaction
+Exec = /usr/bin/pkgundo pacman-hook
+NeedsTargets

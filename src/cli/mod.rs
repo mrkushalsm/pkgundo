@@ -119,4 +119,20 @@ pub enum Commands {
     /// Run the pkgundo daemon (used by systemd; not intended for direct interactive use).
     #[command(hide = true)]
     Daemon,
+
+    /// Detect removal of a tracked package and print a reminder to review its
+    /// accumulated $HOME mutations. Invoked by the pacman hook installed via
+    /// `pkgundo install-hook`; reads removed package names from stdin. Not
+    /// intended for direct interactive use.
+    #[command(hide = true)]
+    PacmanHook,
+
+    /// Install (or remove) the pacman hook that reminds you to review a
+    /// tracked app's accumulated $HOME mutations after `pacman -R` removes
+    /// it. Requires root.
+    InstallHook {
+        /// Remove the hook instead of installing it
+        #[arg(long, default_value = "false")]
+        remove: bool,
+    },
 }

@@ -193,6 +193,24 @@ pub fn load_tracked_app(conn: &Connection, name: &str) -> Result<Option<TrackedA
     .context("Failed to load tracked app")
 }
 
+/// Look up a currently-tracked app by its pacman package name, as opposed
+/// to `load_tracked_app`'s lookup by the name it was tracked under (the two
+/// aren't guaranteed to match, and only `kind='package'` rows have
+/// `package_name` set at all). Used by the pacman removal hook, which only
+/// ever has a package name from stdin, never the tracked-app's own name.
+pub fn load_tracked_app_by_package(conn: &Connection, package_name: &str) -> Result<Option<TrackedApp>> {
+    conn.query_row(
+        &format!(
+            "SELECT {} FROM tracked_apps WHERE package_name = ?1 AND status = 'tracking'",
+            SELECT_COLS
+        ),
+        [package_name],
+        row_to_tracked_app,
+    )
+    .optional()
+    .context("Failed to load tracked app by package name")
+}
+
 /// List tracked apps. `include_all` also returns previously-untracked (historical) rows.
 pub fn list_tracked_apps(conn: &Connection, include_all: bool) -> Result<Vec<TrackedApp>> {
     let sql = if include_all {

@@ -1,3 +1,4 @@
+pub mod hook;
 pub mod query;
 pub mod recover;
 pub mod rollback;
