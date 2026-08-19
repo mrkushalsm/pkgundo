@@ -94,8 +94,13 @@ pub fn group_key_for_path(path: &Path) -> Option<PathBuf> {
 fn tag_for_home_relative(home: &Path, path: &Path) -> GroupTag {
     let rel = path.strip_prefix(home).unwrap_or(path);
     for comp in rel.components() {
-        let s = comp.as_os_str().to_string_lossy().to_lowercase();
-        match s.as_str() {
+        // XDG dirs are dotfiles (~/.cache, ~/.config, ...) — strip a
+        // leading dot before comparing, or ".cache" would never match
+        // "cache" and every real-world cache/log dir would silently fall
+        // through to the Data default instead of being tagged correctly.
+        let raw = comp.as_os_str().to_string_lossy().to_lowercase();
+        let s = raw.trim_start_matches('.');
+        match s {
             "cache" => return GroupTag::Cache,
             "log" | "logs" => return GroupTag::Log,
             "state" => return GroupTag::State,
@@ -310,6 +315,20 @@ mod tests {
         let home = Path::new("/home/alice");
         let tag = tag_for_home_relative(home, Path::new("/home/alice/cache/log"));
         assert_eq!(tag, GroupTag::Cache);
+    }
+
+    #[test]
+    fn tag_matching_handles_real_dotfile_xdg_dirs() {
+        // Real XDG dirs are dotfiles (~/.cache, ~/.local/state, ...) — a
+        // path component keeps its leading dot (".cache", not "cache"),
+        // which a naive exact-match against "cache" would miss entirely.
+        let home = Path::new("/home/alice");
+        assert_eq!(tag_for_home_relative(home, Path::new("/home/alice/.cache/app/f")), GroupTag::Cache);
+        assert_eq!(
+            tag_for_home_relative(home, Path::new("/home/alice/.local/state/app/f")),
+            GroupTag::State
+        );
+        assert_eq!(tag_for_home_relative(home, Path::new("/home/alice/.config/app/f")), GroupTag::Data);
     }
 
     #[test]
