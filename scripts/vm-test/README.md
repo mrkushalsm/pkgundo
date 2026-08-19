@@ -67,6 +67,14 @@ To validate the paths nothing else covers, edit the command passed to
                                  # filesystems, not just same-partition /home. More
                                  # invasive than the main suite, so kept separate rather
                                  # than run on every pass.
+./untrack-review-test.sh        # the untrack --rollback interactive group-review UI:
+                                 # groups mutations, drives piped keep/remove answers,
+                                 # asserts the right group survives on disk and the
+                                 # other doesn't, and that --dry-run stays untouched.
+./pacman-hook-test.sh           # the pacman removal hook: install-hook, real pacman -R
+                                 # of tracked/untracked/bulk packages, the always-exit-0
+                                 # contract even when something inside the hook breaks,
+                                 # and a DB-lock-contention check against a live daemon.
 ```
 
 ## Uninstall-aware cleanup: pacman hook + review UI
