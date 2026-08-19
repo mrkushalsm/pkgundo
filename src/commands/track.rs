@@ -3,6 +3,8 @@ use colored::Colorize;
 
 use crate::daemon::client::send_request;
 use crate::daemon::ipc::{Request, Response};
+use crate::journal;
+use crate::rollback::review::{group_mutations, review_groups_interactive};
 use crate::rollback::{RollbackEngine, RollbackMode};
 
 use super::is_root;
@@ -67,8 +69,26 @@ pub async fn handle_untrack(
         tracked.txid.to_string().cyan()
     );
 
+    let selected_groups = {
+        let conn = crate::db::open_db_readonly(db_path).context("Failed to open pkgundo database")?;
+        let mutations = journal::get_mutations(&conn, tracked.txid)?;
+        let groups = group_mutations(&mutations);
+        if groups.is_empty() {
+            None
+        } else {
+            println!(
+                "  {} {} group(s) of recorded mutations to review:",
+                "→".yellow(),
+                groups.len()
+            );
+            let selected = review_groups_interactive(&groups)?;
+            Some(selected)
+        }
+    };
+
     let engine = RollbackEngine::new(tracked.txid, RollbackMode::from_str(mode), false, db_path)
-        .with_home_cleanup(true);
+        .with_home_cleanup(true)
+        .with_selected_groups(selected_groups);
     let report = engine.execute()?;
     report.print_summary();
 
