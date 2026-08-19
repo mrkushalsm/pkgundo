@@ -208,7 +208,22 @@ async fn handle_request(
         Request::Ping => Response::Pong,
         Request::Track { name } => {
             let conn = conn.lock().await;
-            match crate::tracked_apps::track_app(&conn, &name) {
+            let result = crate::tracked_apps::track_app(&conn, &name);
+            // A readonly reader (e.g. the pacman removal hook, or a user
+            // running `pacman -R` moments after `pkgundo track`) opens the
+            // DB with immutable=1, which bypasses the WAL entirely and
+            // only ever sees the main .db file's last-checkpointed state.
+            // The periodic 1s background checkpoint alone leaves a real
+            // window where a just-tracked app is invisible to such a
+            // reader; checkpoint immediately after this write completes so
+            // it's visible the moment this IPC call returns, not up to a
+            // second later.
+            if result.is_ok() {
+                if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);") {
+                    log::debug!("daemon: post-track WAL checkpoint failed: {}", e);
+                }
+            }
+            match result {
                 Ok(app) => {
                     if let Some(ew) = exec_watch {
                         if let Err(e) = ew.watch_app(&app.name, app.txid, &app.resolved_paths) {
@@ -230,7 +245,16 @@ async fn handle_request(
         }
         Request::Untrack { name } => {
             let conn = conn.lock().await;
-            match crate::tracked_apps::untrack_app(&conn, &name) {
+            let result = crate::tracked_apps::untrack_app(&conn, &name);
+            // See the matching comment on Request::Track — same reasoning
+            // applies to untrack (e.g. `untrack --rollback` reading its own
+            // just-written status change back via a readonly connection).
+            if result.is_ok() {
+                if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);") {
+                    log::debug!("daemon: post-untrack WAL checkpoint failed: {}", e);
+                }
+            }
+            match result {
                 Ok(()) => {
                     if let Some(ew) = exec_watch {
                         ew.unwatch_app(&name);
