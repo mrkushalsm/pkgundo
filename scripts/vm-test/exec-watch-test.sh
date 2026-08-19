@@ -148,7 +148,14 @@ ssh_vm "$IP" "test -f ~/.testapp-marker" || fail "dry-run must not have actually
 
 echo
 echo "== [8] untrack --rollback for real: confirms archive-before-remove and RolledBack status =="
-ssh_vm "$IP" "cd ~/pkgundo && sudo $BIN untrack testapp --rollback"
+# Since the interactive group-review step was added, plain --rollback now
+# prompts per group and defaults to each group's suggested action on EOF
+# (untested stdin) — .testapp-marker tags as "Data" (no cache/log/state/tmp
+# keyword in its path), which defaults to *keep*, not remove. Pipe "a"
+# (remove this and every remaining group) to exercise the same full-cleanup
+# scenario this step has always asserted, now via the review flow rather
+# than around it.
+ssh_vm "$IP" "cd ~/pkgundo && printf 'a\n' | sudo $BIN untrack testapp --rollback"
 ssh_vm "$IP" "test -f ~/.testapp-marker" && fail "~/.testapp-marker should be gone after real rollback"
 ssh_vm "$IP" "sudo find /var/lib/pkgundo/archives/$TXID -iname '*testapp-marker*'" || fail "expected an archive copy of .testapp-marker"
 STATUS="$(ssh_vm "$IP" "sqlite3 /var/lib/pkgundo/pkgundo.db \"SELECT status FROM transactions WHERE txid=$TXID\"")"
@@ -170,11 +177,20 @@ echo "== [9] Daemonizing app: parent exits almost immediately, child does the re
 # gap inherent to polling — not what this step is checking. 15ms is enough
 # to clear that unrelated race while still being a daemonize pattern (parent
 # gone almost immediately), not a normal foreground app lifetime.
-ssh_vm "$IP" "printf '#include <stdio.h>\n#include <stdlib.h>\n#include <unistd.h>\nint main(){pid_t p=fork();if(p==0){setsid();sleep(2);char b[512];snprintf(b,sizeof(b),\"%%s/.daemonize-marker\",getenv(\"HOME\"));FILE*f=fopen(b,\"w\");if(f)fclose(f);_exit(0);}else if(p>0){usleep(15000);_exit(0);}return 1;}\n' > /tmp/d.c && sudo gcc /tmp/d.c -o /usr/local/bin/daemonize-testapp"
+#
+# The child sleeps briefly *after* its write too, mirroring the plain
+# `testapp` binary's own post-write grace sleep above (step 1's comment
+# explains why): without it, this flaked under real VM load — the write's
+# fanotify event and the child's own exit (which tears down the shared
+# mutation-capture mark once no known pid remains alive) can land close
+# enough together to occasionally lose the race, caught via 3 manual
+# retries against a live daemon that all succeeded once this grace period
+# was added, vs. an intermittent failure without it.
+ssh_vm "$IP" "printf '#include <stdio.h>\n#include <stdlib.h>\n#include <unistd.h>\nint main(){pid_t p=fork();if(p==0){setsid();sleep(2);char b[512];snprintf(b,sizeof(b),\"%%s/.daemonize-marker\",getenv(\"HOME\"));FILE*f=fopen(b,\"w\");if(f)fclose(f);sleep(1);_exit(0);}else if(p>0){usleep(15000);_exit(0);}return 1;}\n' > /tmp/d.c && sudo gcc /tmp/d.c -o /usr/local/bin/daemonize-testapp"
 ssh_vm "$IP" "cd ~/pkgundo && $BIN track daemonize-testapp"
 ssh_vm "$IP" "rm -f ~/.daemonize-marker"
 ssh_vm "$IP" "/usr/local/bin/daemonize-testapp"
-sleep 3  # child's sleep(2) + poll/journal margin
+sleep 4  # child's sleep(2) + post-write grace sleep(1) + poll/journal margin
 
 DTXID="$(ssh_vm "$IP" "sqlite3 /var/lib/pkgundo/pkgundo.db \"SELECT txid FROM tracked_apps WHERE name='daemonize-testapp'\"")"
 [ -n "$DTXID" ] || fail "could not find daemonize-testapp's bucket txid"
