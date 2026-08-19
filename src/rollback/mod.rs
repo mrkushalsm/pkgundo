@@ -1,9 +1,12 @@
 use anyhow::{bail, Context, Result};
 use colored::Colorize;
 use rusqlite::Connection;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+pub mod review;
 
 use crate::archive::ArchiveManager;
 use crate::blob_store;
@@ -66,6 +69,13 @@ pub struct RollbackEngine {
     /// strict as it is today. Only tracked-app `untrack --rollback` (which
     /// intentionally captures $HOME mutations) sets this.
     home_cleanup: bool,
+    /// User-selected review-group keys (see `review::group_key_for_path`)
+    /// allowed to be processed. `None` (the default) means no filtering —
+    /// every mutation is processed exactly as before this feature existed;
+    /// used by the standalone `pkgundo rollback` and by `preview_rollback`.
+    /// `Some(set)` is used only by `untrack --rollback`'s real (non-preview)
+    /// path, after the user has reviewed and chosen groups interactively.
+    selected_groups: Option<HashSet<PathBuf>>,
 }
 
 impl RollbackEngine {
@@ -77,6 +87,7 @@ impl RollbackEngine {
             db_path: db_path.to_string(),
             archive_root: None,
             home_cleanup: false,
+            selected_groups: None,
         }
     }
 
@@ -92,6 +103,18 @@ impl RollbackEngine {
     /// opt-in and default false.
     pub fn with_home_cleanup(mut self, on: bool) -> Self {
         self.home_cleanup = on;
+        self
+    }
+
+    /// Restrict processing to only the given review-group keys (see
+    /// `review::group_key_for_path`). A mutation whose key isn't in the set
+    /// is recorded as skipped and never reaches `process_mutation`. A
+    /// mutation whose path doesn't resolve to any group key at all (`None`)
+    /// is never affected by this filter, regardless of what's selected —
+    /// see the field doc for why. `None` here means "no filtering", the
+    /// default, used everywhere except reviewed tracked-app rollback.
+    pub fn with_selected_groups(mut self, groups: Option<HashSet<PathBuf>>) -> Self {
+        self.selected_groups = groups;
         self
     }
 
@@ -161,6 +184,14 @@ impl RollbackEngine {
         for mutation in &mutations {
             let path_str = &mutation.path;
             let path = Path::new(path_str);
+
+            // User-reviewed group filter (tracked-app `untrack --rollback`
+            // only — see `selected_groups`'s field doc).
+            if !mutation_passes_group_filter(path, &self.selected_groups) {
+                report.skipped.push(path_str.clone());
+                continue;
+            }
+
             let category = classify_path(path);
 
             let result = self.process_mutation(
@@ -632,7 +663,25 @@ fn remove_empty_dirs_up_to(mut dir: PathBuf, boundary: &Path) {
 /// The `/home/<user>` or `/root` a path lives under, per the same
 /// convention `home_dir_for_uid` resolves — used only as the removal
 /// boundary above, never to be removed itself.
-fn home_root_of(path: &Path) -> Option<PathBuf> {
+/// Whether a mutation should reach `process_mutation` at all, given the
+/// user's reviewed group selection. `None` selected_groups (the default)
+/// always passes — no filtering. With `Some(selected)`: a mutation whose
+/// group key isn't in the set is excluded; a path with no resolvable group
+/// key at all (`group_key_for_path` returns `None`) always passes too,
+/// never silently excluded — see `RollbackEngine::selected_groups`'s field
+/// doc for why. Pure and filesystem-independent, so it's unit-testable
+/// without needing a real `/home/<user>` path to exist.
+fn mutation_passes_group_filter(path: &Path, selected_groups: &Option<HashSet<PathBuf>>) -> bool {
+    match selected_groups {
+        None => true,
+        Some(selected) => match review::group_key_for_path(path) {
+            Some(key) => selected.contains(&key),
+            None => true,
+        },
+    }
+}
+
+pub(crate) fn home_root_of(path: &Path) -> Option<PathBuf> {
     let mut comps = path.components();
     comps.next()?; // RootDir
     let first = comps.next()?;
@@ -773,5 +822,32 @@ mod tests {
 
         assert!(!sub_dir.exists(), "the genuinely empty leaf should still be removed");
         assert!(app_dir.exists(), "must not remove a directory with other content still in it");
+    }
+
+    #[test]
+    fn group_filter_none_always_passes() {
+        assert!(mutation_passes_group_filter(Path::new("/home/alice/.cache/app/f"), &None));
+    }
+
+    #[test]
+    fn group_filter_excludes_unselected_group() {
+        let selected: HashSet<PathBuf> = [PathBuf::from("/home/alice/.config/app")].into_iter().collect();
+        assert!(mutation_passes_group_filter(
+            Path::new("/home/alice/.config/app/f"),
+            &Some(selected.clone())
+        ));
+        assert!(!mutation_passes_group_filter(
+            Path::new("/home/alice/.cache/app/f"),
+            &Some(selected)
+        ));
+    }
+
+    #[test]
+    fn group_filter_never_excludes_an_ungroupable_path() {
+        // A path with no resolvable group key (e.g. outside any known
+        // home) must always pass the filter, regardless of what's
+        // selected — never silently excluded.
+        let selected: HashSet<PathBuf> = [PathBuf::from("/home/alice/.config/app")].into_iter().collect();
+        assert!(mutation_passes_group_filter(Path::new("/usr/bin/whatever"), &Some(selected)));
     }
 }
