@@ -127,14 +127,15 @@ pub async fn watch_process_tree(
     let _ = pid_tx.send(root_pid).await;
 
     loop {
-        // Check if root is still alive
-        let root_alive = fs::metadata(format!("/proc/{}", root_pid)).is_ok();
-        if !root_alive {
-            log::debug!("ProcessTracker: root PID {} exited", root_pid);
-            break;
-        }
-
-        // Scan for new descendants
+        // Scan for new descendants *before* checking liveness — this
+        // matters because a forked child needs to be discovered while its
+        // PPid still points into our known set. A daemonizing app (fork,
+        // parent exits almost immediately, child does the real work) would
+        // otherwise be missed entirely: once the parent exits, the child
+        // gets reparented (e.g. to init/a subreaper) and no longer walks
+        // back to root_pid via `is_descendant`'s ancestry chain, so it must
+        // be caught on a tick where the original parent-child link still
+        // holds.
         let descendants = tracker.scan_descendants();
         for pid in descendants {
             if tracker.known_pids.insert(pid) {
@@ -161,6 +162,19 @@ pub async fn watch_process_tree(
 
                 let _ = pid_tx.send(pid).await;
             }
+        }
+
+        // Keep monitoring as long as ANY known pid — root or a discovered
+        // descendant — is still alive, not just the root. Gating solely on
+        // root_pid meant a daemonizing app's entire real lifetime went
+        // unwatched: the moment its setup-only parent exited, monitoring
+        // (and the mutation-capture mark it gates) tore down before the
+        // long-lived child had done anything.
+        let any_alive =
+            tracker.known_pids.iter().any(|&pid| fs::metadata(format!("/proc/{}", pid)).is_ok());
+        if !any_alive {
+            log::debug!("ProcessTracker: all known pids exited for txid={}", txid);
+            break;
         }
 
         sleep(poll_interval).await;

@@ -212,11 +212,28 @@ impl ExecWatch {
                         "exec-watch: detected launch of tracked app '{}' (pid={}, path={})",
                         name, pid, exec_path.display()
                     );
+                    // Resolved synchronously, right here, rather than inside
+                    // the spawned task below: a process that forks and lets
+                    // its parent exit immediately (a common daemonize
+                    // pattern) can vanish from /proc within microseconds —
+                    // faster than a tokio::spawn scheduling hop takes. Doing
+                    // this read in the same synchronous loop iteration as
+                    // the event itself closes nearly all of that window.
+                    let uid = match read_real_uid(pid) {
+                        Some(u) => u,
+                        None => {
+                            log::warn!(
+                                "exec-watch: couldn't resolve uid for pid {} (already exited?), skipping launch",
+                                pid
+                            );
+                            continue;
+                        }
+                    };
                     let db_path = db_path.clone();
                     let active_launches = Arc::clone(&active_launches);
                     let mutation_capture = Arc::clone(&mutation_capture);
                     tokio::spawn(async move {
-                        spawn_launch(pid, txid, db_path, active_launches, mutation_capture).await;
+                        spawn_launch(pid, uid, txid, db_path, active_launches, mutation_capture).await;
                     });
                 }
             }
@@ -254,18 +271,12 @@ fn read_real_uid(pid: i32) -> Option<u32> {
 
 async fn spawn_launch(
     pid: i32,
+    uid: u32,
     txid: i64,
     db_path: String,
     active_launches: Arc<Mutex<HashMap<i32, ActiveLaunch>>>,
     mutation_capture: Arc<MutationCapture>,
 ) {
-    let uid = match read_real_uid(pid) {
-        Some(u) => u,
-        None => {
-            log::warn!("exec-watch: couldn't resolve uid for pid {} (already exited?), skipping launch", pid);
-            return;
-        }
-    };
     let home = match crate::scan_leftovers::home_dir_for_uid(uid).filter(|h| is_usable_home(h)) {
         Some(h) => h,
         None => {
