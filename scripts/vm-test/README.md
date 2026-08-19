@@ -53,6 +53,22 @@ To validate the paths nothing else covers, edit the command passed to
 - Adding a system user, to exercise `--mode clean`/`--mode nuclear` user
   rollback.
 
+## Tracked-app / exec-watch tests
+
+```bash
+./exec-watch-test.sh            # main regression suite: exec detection, live mutation
+                                 # capture, overlapping launches, restart re-arming,
+                                 # unresolvable-uid fallback, untrack --rollback, and a
+                                 # daemonizing app (fork, parent exits almost immediately,
+                                 # child does the real work)
+./exec-watch-multifs-test.sh    # separate, heavier: creates a throwaway user + a
+                                 # loop-mounted filesystem to prove per-filesystem mark
+                                 # scoping (st_dev) actually works across two distinct
+                                 # filesystems, not just same-partition /home. More
+                                 # invasive than the main suite, so kept separate rather
+                                 # than run on every pass.
+```
+
 ## Cleaning up
 
 ```bash

@@ -157,6 +157,33 @@ echo "final transaction status: $STATUS"
 echo "PASS: $HOME mutation archived then removed, NeverTouch correctly bypassed only for this opt-in path."
 
 echo
+echo "== [9] Daemonizing app: parent exits almost immediately, child does the real work =="
+# Regression test for a real bug found via manual testing: watch_process_tree
+# used to stop the instant its *root* pid exited, tearing down the
+# mutation-capture mark before a daemonizing app's long-lived child — which
+# does the actual work — had done anything. The fix tracks liveness across
+# the whole known-pid set, not just the root.
+#
+# The parent deliberately survives ~15ms (usleep) before exiting: a true
+# zero-work fork()+_exit() can still race past the exec-watch poll interval
+# (10ms) at the uid-resolution step, a narrower, separate, and still-accepted
+# gap inherent to polling — not what this step is checking. 15ms is enough
+# to clear that unrelated race while still being a daemonize pattern (parent
+# gone almost immediately), not a normal foreground app lifetime.
+ssh_vm "$IP" "printf '#include <stdio.h>\n#include <stdlib.h>\n#include <unistd.h>\nint main(){pid_t p=fork();if(p==0){setsid();sleep(2);char b[512];snprintf(b,sizeof(b),\"%%s/.daemonize-marker\",getenv(\"HOME\"));FILE*f=fopen(b,\"w\");if(f)fclose(f);_exit(0);}else if(p>0){usleep(15000);_exit(0);}return 1;}\n' > /tmp/d.c && sudo gcc /tmp/d.c -o /usr/local/bin/daemonize-testapp"
+ssh_vm "$IP" "cd ~/pkgundo && $BIN track daemonize-testapp"
+ssh_vm "$IP" "rm -f ~/.daemonize-marker"
+ssh_vm "$IP" "/usr/local/bin/daemonize-testapp"
+sleep 3  # child's sleep(2) + poll/journal margin
+
+DTXID="$(ssh_vm "$IP" "sqlite3 /var/lib/pkgundo/pkgundo.db \"SELECT txid FROM tracked_apps WHERE name='daemonize-testapp'\"")"
+[ -n "$DTXID" ] || fail "could not find daemonize-testapp's bucket txid"
+DMUT_COUNT="$(ssh_vm "$IP" "sqlite3 /var/lib/pkgundo/pkgundo.db \"SELECT COUNT(*) FROM mutations WHERE txid=$DTXID AND path LIKE '%.daemonize-marker'\"")"
+echo "mutation rows for .daemonize-marker under txid=$DTXID: $DMUT_COUNT"
+[ "$DMUT_COUNT" -ge 1 ] || fail "daemonized child's write was not captured — watch_process_tree root-pid-only regression"
+echo "PASS: mutation capture followed the daemonizing child's real lifetime, not just its exiting parent."
+
+echo
 echo "== Reverting VM back to clean snapshot (leaving it ready for next run) =="
 virsh snapshot-revert "$VM_NAME" "$SNAPSHOT_NAME" --running >/dev/null
 
