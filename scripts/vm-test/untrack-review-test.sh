@@ -61,7 +61,16 @@ echo
 echo "== [1] Building a test binary that writes into two distinguishable groups =="
 # ~/.cache/testapp/... tags as Cache (default: remove); ~/.config/testapp/...
 # tags as Data (default: keep) — see review.rs's tagging heuristic.
-ssh_vm "$IP" "printf '#include <stdio.h>\n#include <stdlib.h>\n#include <unistd.h>\n#include <sys/stat.h>\nint main(){sleep(1);char home[256];snprintf(home,sizeof(home),\"%%s\",getenv(\"HOME\"));char d1[512],d2[512],p1[512],p2[512];snprintf(d1,sizeof(d1),\"%%s/.cache/testapp\",home);snprintf(d2,sizeof(d2),\"%%s/.config/testapp\",home);mkdir(d1,0755);mkdir(d2,0755);snprintf(p1,sizeof(p1),\"%%s/data.tmp\",d1);snprintf(p2,sizeof(p2),\"%%s/settings.conf\",d2);FILE*f1=fopen(p1,\"w\");if(f1)fclose(f1);FILE*f2=fopen(p2,\"w\");if(f2)fclose(f2);sleep(1);return 0;}\n' > /tmp/rt.c && sudo gcc -x c /tmp/rt.c -o /usr/local/bin/reviewtestapp"
+#
+# Creates each parent XDG dir explicitly (~/.cache, then ~/.cache/testapp,
+# same for ~/.config) rather than a single non-recursive mkdir() straight
+# to the leaf: this minimal Arch cloud image has neither ~/.cache nor
+# ~/.config pre-created for a fresh user, and a single mkdir() to a leaf
+# whose parent doesn't exist fails with ENOENT — silently, since the return
+# value went unchecked — meaning the fopen() calls after it silently failed
+# too and nothing was ever written. Caught via a live VM run showing 0
+# mutations captured despite the mark correctly arming/disarming.
+ssh_vm "$IP" "printf '#include <stdio.h>\n#include <stdlib.h>\n#include <unistd.h>\n#include <sys/stat.h>\nint main(){sleep(1);char home[256];snprintf(home,sizeof(home),\"%%s\",getenv(\"HOME\"));char c0[512],d1[512],c1[512],d2[512],p1[512],p2[512];snprintf(c0,sizeof(c0),\"%%s/.cache\",home);snprintf(d1,sizeof(d1),\"%%s/.cache/testapp\",home);snprintf(c1,sizeof(c1),\"%%s/.config\",home);snprintf(d2,sizeof(d2),\"%%s/.config/testapp\",home);mkdir(c0,0755);mkdir(d1,0755);mkdir(c1,0755);mkdir(d2,0755);snprintf(p1,sizeof(p1),\"%%s/data.tmp\",d1);snprintf(p2,sizeof(p2),\"%%s/settings.conf\",d2);FILE*f1=fopen(p1,\"w\");if(f1)fclose(f1);FILE*f2=fopen(p2,\"w\");if(f2)fclose(f2);sleep(1);return 0;}\n' > /tmp/rt.c && sudo gcc -x c /tmp/rt.c -o /usr/local/bin/reviewtestapp"
 ssh_vm "$IP" "file /usr/local/bin/reviewtestapp | grep -q ELF" || fail "reviewtestapp did not build as a real ELF binary"
 
 echo
