@@ -69,6 +69,49 @@ To validate the paths nothing else covers, edit the command passed to
                                  # than run on every pass.
 ```
 
+## Uninstall-aware cleanup: pacman hook + review UI
+
+```bash
+sudo pkgundo install-hook            # once, requires root — installs the
+                                      # pacman removal hook
+sudo pkgundo install-hook --remove   # uninstalls it again
+```
+
+After this, removing a tracked app through pacman (`pacman -R weechat`,
+`pacman -Rs ...`, an AUR helper, etc.) prints a reminder right in that same
+terminal, naming the app and how many mutations were recorded, e.g.:
+
+```
+→ pkgundo was tracking removed package 'weechat' (23 mutation(s) recorded under $HOME).
+  Review and roll back: pkgundo untrack weechat --rollback
+  Preview first:         pkgundo untrack weechat --rollback --dry-run
+```
+
+The hook only ever detects and prints — it never touches `$HOME` itself.
+Running `pkgundo untrack <app> --rollback` (without `--dry-run`) now walks
+you through the recorded mutations in groups (home-relative path, capped at
+2 components — e.g. `~/.config/weechat` and `~/.local/share/weechat/logs`
+end up as two separate groups) instead of archiving/removing everything
+unconditionally. Each group shows a suggested default (cache/log/state/tmp
+directories default to remove; everything else defaults to keep) and takes:
+
+- **Enter** — accept the suggested default
+- **r** — remove this group
+- **k** — keep this group
+- **a** — remove this and every remaining group, no further prompts
+- **s** — keep this and every remaining group, no further prompts
+- **l** — list every file in this group, then re-ask about it
+
+`--dry-run` is untouched by any of this — it stays a full, non-interactive
+preview, exactly as before.
+
+`pkgundo install-hook` is a manual, one-time step for now — there's no
+packaging for pkgundo itself yet (no PKGBUILD), so nothing can trigger this
+automatically on install. Once packaging exists, the hook file belongs in
+`package()`'s output straight into `/usr/share/libalpm/hooks/`, which
+pacman auto-scans — making this genuinely automatic and the CLI command
+optional.
+
 ## Cleaning up
 
 ```bash
