@@ -81,7 +81,25 @@ fn always_skipped(operation: &str) -> bool {
 pub fn group_key_for_path(path: &Path) -> Option<PathBuf> {
     let home = home_root_of(path)?;
     let rel = path.strip_prefix(&home).ok()?;
-    let capped: PathBuf = rel.components().take(2).collect();
+    let comps: Vec<_> = rel.components().collect();
+
+    // `~/.local/share/<app>` and `~/.local/state/<app>` are real apps'
+    // XDG data/state dirs one level deeper than `~/.config/<app>` — found
+    // by testing against a real app (weechat) that actually uses this
+    // layout, which neither the node_modules nor .config/app unit-test
+    // fixtures happened to exercise. A flat depth-2 cap lands on
+    // `~/.local/share` for *every* app, collapsing all of them into one
+    // group; treat that two-segment prefix as one logical level so the
+    // cap effectively becomes 3 raw components in this one case.
+    let depth = match comps.first().map(|c| c.as_os_str().to_string_lossy().to_lowercase()) {
+        Some(ref first) if first == ".local" => match comps.get(1).map(|c| c.as_os_str().to_string_lossy().to_lowercase()) {
+            Some(ref second) if second == "share" || second == "state" => 3,
+            _ => 2,
+        },
+        _ => 2,
+    };
+
+    let capped: PathBuf = comps.into_iter().take(depth).collect();
     if capped.as_os_str().is_empty() {
         return None;
     }
@@ -302,6 +320,30 @@ mod tests {
     fn group_key_collapses_config_nesting() {
         let key = group_key_for_path(Path::new("/home/alice/.config/weechat/weechat.conf"));
         assert_eq!(key, Some(PathBuf::from("/home/alice/.config/weechat")));
+    }
+
+    #[test]
+    fn group_key_treats_local_share_prefix_as_one_level() {
+        // Found via testing against a real app (weechat) that actually uses
+        // this layout: a flat depth-2 cap would land on `~/.local/share`
+        // for every app, collapsing every app's data dir into one bucket.
+        let key = group_key_for_path(Path::new("/home/alice/.local/share/weechat/logs/irc.log"));
+        assert_eq!(key, Some(PathBuf::from("/home/alice/.local/share/weechat")));
+        let key2 = group_key_for_path(Path::new("/home/alice/.local/share/weechat/guile/f.scm"));
+        assert_eq!(key2, Some(PathBuf::from("/home/alice/.local/share/weechat")));
+    }
+
+    #[test]
+    fn group_key_local_share_still_separates_distinct_apps() {
+        let a = group_key_for_path(Path::new("/home/alice/.local/share/weechat/logs/f")).unwrap();
+        let b = group_key_for_path(Path::new("/home/alice/.local/share/newsboat/cache.db")).unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn group_key_treats_local_state_prefix_as_one_level() {
+        let key = group_key_for_path(Path::new("/home/alice/.local/state/weechat/weechat.log"));
+        assert_eq!(key, Some(PathBuf::from("/home/alice/.local/state/weechat")));
     }
 
     #[test]
