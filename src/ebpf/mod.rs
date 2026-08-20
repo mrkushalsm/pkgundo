@@ -352,14 +352,32 @@ impl FanotifyMonitor {
                 break;
             }
 
-            // Cheap check first: is this pid one we actually care about?
-            // Skips handle resolution entirely for the overwhelming majority
-            // of events on a whole-filesystem mark.
-            let mount_fd = {
+            // Cheap check first: is this exact pid one we actually care
+            // about? Skips both handle resolution and the (comparatively
+            // costly, one /proc read each) tgid-resolution fallback below
+            // for the overwhelming majority of events on a whole-filesystem
+            // mark, which come from entirely unrelated system processes.
+            let cheap_mount_fd = {
                 let guard = active_launches.lock().unwrap_or_else(|p| p.into_inner());
                 guard.get(&meta.pid).map(|l| l.mount_fd)
             };
-            if let Some(mount_fd) = mount_fd {
+            let resolved = if let Some(mount_fd) = cheap_mount_fd {
+                Some((meta.pid, mount_fd))
+            } else {
+                // fanotify's reported pid is actually the tid of whichever
+                // thread performed the I/O — a worker thread performing a
+                // tracked launch's own write (e.g. Node's libuv threadpool,
+                // which backs many of npm's own blocking `fs` writes) never
+                // matches the launch's registered main pid directly. Only
+                // pay for resolving this on a miss, so single-threaded
+                // launches (the common case) stay exactly as cheap as
+                // before this fix. See resolve_tgid's doc for the full story.
+                resolve_tgid(meta.pid).and_then(|tgid| {
+                    let guard = active_launches.lock().unwrap_or_else(|p| p.into_inner());
+                    guard.get(&tgid).map(|l| (tgid, l.mount_fd))
+                })
+            };
+            if let Some((tgid, mount_fd)) = resolved {
                 let mut info_offset = offset + meta.metadata_len as usize;
                 let mut path = None;
                 while info_offset + 4 <= event_end {
@@ -382,8 +400,8 @@ impl FanotifyMonitor {
                     // decision from current state is the safe default: an
                     // event from a launch that just ended is correctly dropped.
                     let guard = active_launches.lock().unwrap_or_else(|p| p.into_inner());
-                    if let Some(txid) = attribute_event(meta.pid, &p, &guard) {
-                        events.push((meta.mask, meta.pid, p, txid));
+                    if let Some(txid) = attribute_event(tgid, &p, &guard) {
+                        events.push((meta.mask, tgid, p, txid));
                     }
                 }
             }
@@ -700,6 +718,33 @@ fn is_excluded_fanotify(path: &std::path::Path) -> bool {
         || s.starts_with("/var/lib/pkgundo")
 }
 
+/// fanotify reports the kernel `pid` field as the actual *thread ID* that
+/// performed the I/O, not necessarily the process's main pid (== tgid) —
+/// they're only the same for a single-threaded process or its main thread.
+/// A launch is only ever registered in `active_launches` under its main
+/// pid, so any write happening on a worker thread with a different tid
+/// (e.g. Node.js's libuv threadpool, which is exactly what backs many of
+/// npm's own blocking `fs` writes — its content-addressable cache store in
+/// particular) would silently never match `active_launches.get(&tid)` and
+/// get dropped, even though the mark stayed armed for the launch's entire
+/// real lifetime. Found live: a real `npm install` with the mark correctly
+/// armed for its whole ~8s duration still missed ~85% of the files it
+/// actually wrote, overwhelmingly under `~/.npm/_cacache/`. Resolve each
+/// event's tid to its owning process's tgid via `/proc/<tid>/status`
+/// before any `active_launches` lookup — `None` if the thread has already
+/// exited by the time this reads it (fail-closed, matching every other
+/// best-effort attribution step here: the event is simply dropped, same
+/// as any other event that can't be resolved).
+fn resolve_tgid(tid: i32) -> Option<i32> {
+    let status = fs::read_to_string(format!("/proc/{}/status", tid)).ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Tgid:") {
+            return rest.trim().parse::<i32>().ok();
+        }
+    }
+    None
+}
+
 /// Given an already-resolved event `(pid, path)`, decide whether it belongs
 /// to a currently-active tracked-app launch and if so which txid to record
 /// it against. `path.starts_with` is component-aware (not a string-prefix
@@ -725,6 +770,20 @@ mod tests {
         // on it for later open_by_handle_at use, which these tests never
         // reach (attribute_event is pure path/map logic).
         ActiveLaunch::new(txid, PathBuf::from(home)).expect("home dir must exist for this test")
+    }
+
+    #[test]
+    fn resolve_tgid_of_own_process_is_own_pid() {
+        // The test harness's own main thread: tid == tgid == pid, so this
+        // should resolve to exactly std::process::id().
+        let pid = std::process::id() as i32;
+        assert_eq!(resolve_tgid(pid), Some(pid));
+    }
+
+    #[test]
+    fn resolve_tgid_of_nonexistent_pid_is_none() {
+        // A pid this large is vanishingly unlikely to exist.
+        assert_eq!(resolve_tgid(i32::MAX - 1), None);
     }
 
     #[test]
