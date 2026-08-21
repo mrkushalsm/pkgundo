@@ -684,7 +684,7 @@ impl FanotifyMonitor {
     /// `mark_filesystem` on the same group concurrently with this loop.
     pub async fn run_shared(
         self: Arc<Self>,
-        mutation_tx: mpsc::Sender<MutationRecord>,
+        mutation_tx: mpsc::Sender<crate::journal::JournalMessage>,
         active_launches: Arc<Mutex<HashMap<i32, ActiveLaunch>>>,
     ) {
         log::info!("Shared mutation-capture group running");
@@ -712,7 +712,7 @@ impl FanotifyMonitor {
                     post_hash: None,
                 };
 
-                let _ = mutation_tx.send(record).await;
+                let _ = mutation_tx.send(crate::journal::JournalMessage::Record(record)).await;
             }
 
             // A full buffer means the kernel very likely still has more

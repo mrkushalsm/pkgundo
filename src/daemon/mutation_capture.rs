@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::ebpf::{ActiveLaunch, FanotifyMonitor};
-use crate::journal::MutationRecord;
+use crate::journal::JournalMessage;
 
 struct RunningGroup {
     monitor: Arc<FanotifyMonitor>,
@@ -26,20 +26,33 @@ struct Inner {
 }
 
 pub struct MutationCapture {
-    mutation_tx: mpsc::Sender<MutationRecord>,
+    mutation_tx: mpsc::Sender<JournalMessage>,
     active_launches: Arc<Mutex<HashMap<i32, ActiveLaunch>>>,
     inner: Mutex<Inner>,
 }
 
 impl MutationCapture {
     pub fn new(
-        mutation_tx: mpsc::Sender<MutationRecord>,
+        mutation_tx: mpsc::Sender<JournalMessage>,
         active_launches: Arc<Mutex<HashMap<i32, ActiveLaunch>>>,
     ) -> Self {
         Self {
             mutation_tx,
             active_launches,
             inner: Mutex::new(Inner { refcounts: HashMap::new(), group: None }),
+        }
+    }
+
+    /// Block until every mutation already captured *as of this call* has
+    /// been appended to the database — see `JournalMessage::Flush`'s doc.
+    /// Works regardless of whether a capture group is currently running:
+    /// the barrier travels through the same long-lived channel the
+    /// daemon's one journal-writing task drains for its whole life, not
+    /// through any particular filesystem's group.
+    pub async fn flush(&self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.mutation_tx.send(JournalMessage::Flush(tx)).await.is_ok() {
+            let _ = rx.await;
         }
     }
 

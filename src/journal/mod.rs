@@ -17,6 +17,21 @@ pub struct MutationRecord {
     pub post_hash: Option<String>, // SHA256 after modification
 }
 
+/// Sent over the daemon's shared mutation-capture channel. `Flush` is a
+/// synchronization barrier, not a data record: because the channel is FIFO,
+/// a `Flush` sent at some point in time is only handled by the journal
+/// task after every `Record` already queued ahead of it has been appended —
+/// so acking it is a genuine guarantee that "everything captured so far is
+/// now in the database," not a best-effort delay. Used by `untrack
+/// --rollback` to close a real (if normally tiny) gap: the journal task
+/// appends records asynchronously off this channel, so without a barrier
+/// there's no guarantee a just-finished app's last write has actually
+/// landed in the database by the time rollback reads it back out.
+pub enum JournalMessage {
+    Record(MutationRecord),
+    Flush(tokio::sync::oneshot::Sender<()>),
+}
+
 /// Append a mutation record to the journal (SQLite mutations table).
 /// This is the core append-only journaling operation.
 pub fn append_mutation(conn: &Connection, record: &MutationRecord) -> Result<i64> {

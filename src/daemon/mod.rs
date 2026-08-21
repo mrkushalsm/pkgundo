@@ -97,7 +97,12 @@ pub async fn run_daemon(db_path: &str) -> Result<()> {
     // One long-lived mutation channel + journal-writing collector task for
     // the daemon's whole life, decoupled from individual launches/groups
     // starting and stopping — mirrors `commands/run.rs`'s journal task.
-    let (mutation_tx, mut mutation_rx) = mpsc::channel::<crate::journal::MutationRecord>(4096);
+    // Carries `JournalMessage` rather than a bare `MutationRecord` so
+    // `Untrack` can send a `Flush` barrier through the same (FIFO) channel
+    // and be sure every record queued ahead of it has actually been
+    // appended before rollback reads the database back out — see
+    // `JournalMessage`'s doc for why a fixed delay isn't good enough here.
+    let (mutation_tx, mut mutation_rx) = mpsc::channel::<crate::journal::JournalMessage>(4096);
     let db_path_for_journal = db_path.to_string();
     tokio::spawn(async move {
         let conn = match crate::db::open_db(&db_path_for_journal) {
@@ -107,9 +112,16 @@ pub async fn run_daemon(db_path: &str) -> Result<()> {
                 return;
             }
         };
-        while let Some(record) = mutation_rx.recv().await {
-            if let Err(e) = crate::journal::append_mutation(&conn, &record) {
-                log::debug!("daemon journal task: dedup/error: {}", e);
+        while let Some(msg) = mutation_rx.recv().await {
+            match msg {
+                crate::journal::JournalMessage::Record(record) => {
+                    if let Err(e) = crate::journal::append_mutation(&conn, &record) {
+                        log::debug!("daemon journal task: dedup/error: {}", e);
+                    }
+                }
+                crate::journal::JournalMessage::Flush(ack) => {
+                    let _ = ack.send(());
+                }
             }
         }
     });
@@ -140,8 +152,9 @@ pub async fn run_daemon(db_path: &str) -> Result<()> {
                     Ok((stream, _addr)) => {
                         let conn = Arc::clone(&conn);
                         let exec_watch = exec_watch.clone();
+                        let mutation_capture = Arc::clone(&mutation_capture);
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, conn, exec_watch).await {
+                            if let Err(e) = handle_connection(stream, conn, exec_watch, mutation_capture).await {
                                 log::debug!("daemon: connection handler error: {}", e);
                             }
                         });
@@ -171,6 +184,7 @@ async fn handle_connection(
     stream: UnixStream,
     conn: Arc<Mutex<Connection>>,
     exec_watch: Option<Arc<ExecWatch>>,
+    mutation_capture: Arc<MutationCapture>,
 ) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -187,7 +201,7 @@ async fn handle_connection(
         }
 
         let response = match serde_json::from_str::<Request>(line) {
-            Ok(req) => handle_request(&conn, &exec_watch, req).await,
+            Ok(req) => handle_request(&conn, &exec_watch, &mutation_capture, req).await,
             Err(e) => Response::Error { message: format!("Malformed request: {}", e) },
         };
 
@@ -202,6 +216,7 @@ async fn handle_connection(
 async fn handle_request(
     conn: &Arc<Mutex<Connection>>,
     exec_watch: &Option<Arc<ExecWatch>>,
+    mutation_capture: &Arc<MutationCapture>,
     req: Request,
 ) -> Response {
     match req {
@@ -246,18 +261,25 @@ async fn handle_request(
         Request::Untrack { name } => {
             let conn = conn.lock().await;
             let result = crate::tracked_apps::untrack_app(&conn, &name);
-            // See the matching comment on Request::Track — same reasoning
-            // applies to untrack (e.g. `untrack --rollback` reading its own
-            // just-written status change back via a readonly connection).
-            if result.is_ok() {
-                if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);") {
-                    log::debug!("daemon: post-untrack WAL checkpoint failed: {}", e);
-                }
-            }
             match result {
                 Ok(()) => {
                     if let Some(ew) = exec_watch {
                         ew.unwatch_app(&name);
+                    }
+                    // `untrack --rollback` reads mutations back out via its
+                    // own readonly connection right after this call returns.
+                    // The journal task that actually appends captured
+                    // mutations to the database runs asynchronously off a
+                    // channel — without waiting for it to drain, there's no
+                    // guarantee the app's last few writes (still in flight
+                    // through that channel at this exact moment) have
+                    // landed yet. Flush first, so this really is a
+                    // guarantee and not a hopeful delay; only then
+                    // checkpoint the WAL so the CLI's `immutable=1` reader
+                    // (which bypasses the WAL entirely) can actually see it.
+                    mutation_capture.flush().await;
+                    if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);") {
+                        log::debug!("daemon: post-untrack WAL checkpoint failed: {}", e);
                     }
                     Response::Ok { message: format!("Stopped tracking '{}'", name) }
                 }
@@ -291,20 +313,49 @@ mod tests {
         let conn = Arc::new(Mutex::new(crate::db::init_db(db_path.to_str().unwrap()).unwrap()));
         let exec_watch: Option<Arc<ExecWatch>> = None;
 
-        assert!(matches!(handle_request(&conn, &exec_watch, Request::Ping).await, Response::Pong));
+        let (mutation_tx, mut mutation_rx) = mpsc::channel::<crate::journal::JournalMessage>(4);
+        let mutation_capture =
+            Arc::new(MutationCapture::new(mutation_tx, Arc::new(StdMutex::new(HashMap::new()))));
+        tokio::spawn(async move {
+            while let Some(msg) = mutation_rx.recv().await {
+                if let crate::journal::JournalMessage::Flush(ack) = msg {
+                    let _ = ack.send(());
+                }
+            }
+        });
 
-        let resp =
-            handle_request(&conn, &exec_watch, Request::Track { name: "/bin/ls".to_string() }).await;
+        assert!(matches!(
+            handle_request(&conn, &exec_watch, &mutation_capture, Request::Ping).await,
+            Response::Pong
+        ));
+
+        let resp = handle_request(
+            &conn,
+            &exec_watch,
+            &mutation_capture,
+            Request::Track { name: "/bin/ls".to_string() },
+        )
+        .await;
         assert!(matches!(resp, Response::Ok { .. }), "expected Ok, got {:?}", resp);
 
-        let resp = handle_request(&conn, &exec_watch, Request::ListTracked { all: false }).await;
+        let resp =
+            handle_request(&conn, &exec_watch, &mutation_capture, Request::ListTracked { all: false })
+                .await;
         match resp {
             Response::TrackedList { apps } => assert_eq!(apps.len(), 1),
             other => panic!("expected TrackedList, got {:?}", other),
         }
 
-        let resp =
-            handle_request(&conn, &exec_watch, Request::Untrack { name: "/bin/ls".to_string() }).await;
+        // Exercises the new Untrack -> flush() -> checkpoint sequence: this
+        // must still resolve to Ok, not hang, given a real consumer on the
+        // other end of the channel acking the Flush barrier.
+        let resp = handle_request(
+            &conn,
+            &exec_watch,
+            &mutation_capture,
+            Request::Untrack { name: "/bin/ls".to_string() },
+        )
+        .await;
         assert!(matches!(resp, Response::Ok { .. }), "expected Ok, got {:?}", resp);
     }
 }
