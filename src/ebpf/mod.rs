@@ -193,6 +193,21 @@ pub struct FanotifyMonitor {
     pub txid: i64,
     fanotify_fd: RawFd,
     pub pid_attribution: bool,
+    /// tid -> tgid, populated proactively (see `refresh_tid_cache`) rather
+    /// than only resolved lazily at event-read time. A short-lived worker
+    /// thread (e.g. mpd's own db-update thread: scan, write, rename, then
+    /// exit — often within a handful of milliseconds) can fully terminate
+    /// between generating its write's fanotify event and this monitor
+    /// getting around to reading it; a live `/proc/<tid>/status` read at
+    /// that point fails and the event is dropped even though the write was
+    /// perfectly real. Caching the mapping while the thread is still known
+    /// to be alive means a later lookup doesn't depend on it still being
+    /// alive. Verified live: a real `mpd` library-database write from its
+    /// update thread was silently lost every time without this cache, while
+    /// same-process writes from longer-lived threads (main thread's log/pid
+    /// writes) were never affected — this only ever hit exactly the kind of
+    /// thread short-lived enough to race a live re-resolve.
+    tid_cache: Mutex<HashMap<i32, i32>>,
 }
 
 impl FanotifyMonitor {
@@ -217,7 +232,27 @@ impl FanotifyMonitor {
             txid,
             fanotify_fd: fd as RawFd,
             pid_attribution: true,
+            tid_cache: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Rescan every currently-known launch's live threads and record their
+    /// tid -> tgid mapping, and drop cached entries for launches that are no
+    /// longer active. Cheap: real launch counts are 0-2 at a time, each with
+    /// a handful of threads at most, so this is a small `/proc` directory
+    /// listing per known launch, not a whole-system scan.
+    fn refresh_tid_cache(&self, active_launches: &Mutex<HashMap<i32, ActiveLaunch>>) {
+        let known_tgids: Vec<i32> = {
+            let guard = active_launches.lock().unwrap_or_else(|p| p.into_inner());
+            guard.keys().copied().collect()
+        };
+        let mut cache = self.tid_cache.lock().unwrap_or_else(|p| p.into_inner());
+        cache.retain(|_, tgid| known_tgids.contains(tgid));
+        for tgid in known_tgids {
+            for tid in scan_thread_ids(tgid) {
+                cache.insert(tid, tgid);
+            }
+        }
     }
 
     /// Mark filesystem paths for monitoring
@@ -372,7 +407,17 @@ impl FanotifyMonitor {
                 // pay for resolving this on a miss, so single-threaded
                 // launches (the common case) stay exactly as cheap as
                 // before this fix. See resolve_tgid's doc for the full story.
-                resolve_tgid(meta.pid).and_then(|tgid| {
+                //
+                // Check the proactively-populated cache before falling back
+                // to a live re-resolve: a short-lived worker thread can have
+                // already exited by the time we get here, which would make
+                // the live read fail even though the write was real — see
+                // `tid_cache`'s doc.
+                let cached_tgid = {
+                    let cache = self.tid_cache.lock().unwrap_or_else(|p| p.into_inner());
+                    cache.get(&meta.pid).copied()
+                };
+                cached_tgid.or_else(|| resolve_tgid(meta.pid)).and_then(|tgid| {
                     let guard = active_launches.lock().unwrap_or_else(|p| p.into_inner());
                     guard.get(&tgid).map(|l| (tgid, l.mount_fd))
                 })
@@ -645,6 +690,7 @@ impl FanotifyMonitor {
         log::info!("Shared mutation-capture group running");
 
         loop {
+            self.refresh_tid_cache(&active_launches);
             let (events, buffer_was_full) = self.read_events_filtered(&active_launches);
             for (mask, pid, path, txid) in events {
                 if is_excluded_fanotify(&path) {
@@ -745,6 +791,22 @@ fn resolve_tgid(tid: i32) -> Option<i32> {
     None
 }
 
+/// Every currently-live thread id under `tgid`, via `/proc/<tgid>/task/`.
+/// Empty (not an error) if `tgid` has already exited entirely by the time
+/// this reads it — same fail-closed posture as every other best-effort
+/// `/proc` read in this module.
+fn scan_thread_ids(tgid: i32) -> Vec<i32> {
+    let mut tids = Vec::new();
+    if let Ok(entries) = fs::read_dir(format!("/proc/{}/task", tgid)) {
+        for entry in entries.flatten() {
+            if let Ok(tid) = entry.file_name().to_string_lossy().parse::<i32>() {
+                tids.push(tid);
+            }
+        }
+    }
+    tids
+}
+
 /// Given an already-resolved event `(pid, path)`, decide whether it belongs
 /// to a currently-active tracked-app launch and if so which txid to record
 /// it against. `path.starts_with` is component-aware (not a string-prefix
@@ -784,6 +846,18 @@ mod tests {
     fn resolve_tgid_of_nonexistent_pid_is_none() {
         // A pid this large is vanishingly unlikely to exist.
         assert_eq!(resolve_tgid(i32::MAX - 1), None);
+    }
+
+    #[test]
+    fn scan_thread_ids_finds_own_running_thread() {
+        let own_tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+        let tids = scan_thread_ids(std::process::id() as i32);
+        assert!(tids.contains(&own_tid), "expected {:?} to contain own tid {}", tids, own_tid);
+    }
+
+    #[test]
+    fn scan_thread_ids_of_nonexistent_tgid_is_empty() {
+        assert!(scan_thread_ids(i32::MAX - 1).is_empty());
     }
 
     #[test]
