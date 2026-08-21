@@ -316,6 +316,22 @@ async fn spawn_launch(
     crate::process_tracker::watch_process_tree(pid, txid, db_path, pid_tx).await;
     collector.abort();
 
+    // The process tree is confirmed dead, but a very common shutdown
+    // pattern (save state, then exit — exactly what mpd, weechat, and most
+    // real daemons do) means its very last write can still be sitting
+    // unread in the kernel's fanotify queue at this exact instant:
+    // `watch_process_tree`'s exit check runs on its own ~50ms poll, fully
+    // uncoordinated with the shared mutation-capture loop's own ~10ms read
+    // cycle. Pruning `active_launches` immediately would drop that final
+    // write on arrival — attribution would already fail by the time it's
+    // read. A short grace period gives the capture loop several full
+    // cycles to catch up before this launch's attribution disappears.
+    // Verified against a real mpd shutdown: without this, its `database`
+    // and `state` files (both written synchronously right before exit)
+    // were lost every time, while earlier writes in the same process's
+    // life (its log file, its pidfile) were captured fine.
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
     let pids: Vec<i32> = launch_pids.lock().unwrap_or_else(|p| p.into_inner()).iter().copied().collect();
     {
         let mut guard = active_launches.lock().unwrap_or_else(|p| p.into_inner());
