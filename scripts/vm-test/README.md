@@ -77,13 +77,26 @@ To validate the paths nothing else covers, edit the command passed to
                                  # and a DB-lock-contention check against a live daemon.
 ```
 
-## Uninstall-aware cleanup: pacman hook + review UI
+## Uninstall-aware cleanup: pacman hooks + review UI
 
 ```bash
-sudo pkgundo install-hook            # once, requires root — installs the
-                                      # pacman removal hook
-sudo pkgundo install-hook --remove   # uninstalls it again
+sudo pkgundo install-hook            # once, requires root — installs both
+                                      # pacman hooks below
+sudo pkgundo install-hook --remove   # uninstalls both again
 ```
+
+This installs two hooks as one unit:
+
+- **Install-time**: `pacman -S <pkg>` (or an AUR helper, etc.) auto-tracks
+  `<pkg>` via the daemon, but only if it's *explicitly* installed — checked
+  via `pacman -Qi <pkg>`'s "Install Reason" field — not merely pulled in as
+  someone else's dependency. This means you never have to run `pkgundo
+  track` by hand for something you deliberately installed; a dependency
+  library dragged in alongside it is left alone, so `pkgundo tracked` and
+  the exec-watch mark set don't get flooded with things nobody asked to
+  have watched. Already-tracked packages are skipped (no-op), so re-running
+  an install doesn't reset an app's accumulated mutation history.
+- **Removal-time**: unchanged from before — a reminder, never a side effect.
 
 After this, removing a tracked app through pacman (`pacman -R weechat`,
 `pacman -Rs ...`, an AUR helper, etc.) prints a reminder right in that same
@@ -115,7 +128,7 @@ preview, exactly as before.
 
 `pkgundo install-hook` is a manual, one-time step for now — there's no
 packaging for pkgundo itself yet (no PKGBUILD), so nothing can trigger this
-automatically on install. Once packaging exists, the hook file belongs in
+automatically on install. Once packaging exists, both hook files belong in
 `package()`'s output straight into `/usr/share/libalpm/hooks/`, which
 pacman auto-scans — making this genuinely automatic and the CLI command
 optional.

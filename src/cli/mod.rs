@@ -127,9 +127,16 @@ pub enum Commands {
     #[command(hide = true)]
     PacmanHook,
 
-    /// Install (or remove) the pacman hook that reminds you to review a
-    /// tracked app's accumulated $HOME mutations after `pacman -R` removes
-    /// it. Requires root.
+    /// Auto-track a newly, explicitly installed package. Invoked by the
+    /// pacman hook installed via `pkgundo install-hook`; reads installed
+    /// package names from stdin, skips anything pulled in only as a
+    /// dependency. Not intended for direct interactive use.
+    #[command(hide = true)]
+    PacmanHookInstall,
+
+    /// Install (or remove) the pacman hooks that auto-track newly installed
+    /// packages and remind you to review a tracked app's accumulated $HOME
+    /// mutations after `pacman -R` removes it. Requires root.
     InstallHook {
         /// Remove the hook instead of installing it
         #[arg(long, default_value = "false")]

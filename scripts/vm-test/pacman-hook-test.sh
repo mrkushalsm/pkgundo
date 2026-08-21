@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Regression test for the pacman removal-hook reminder: `pkgundo install-hook`
-# actually installs a working hook, a real `pacman -R` of a tracked package
-# prints the reminder (single-match and bulk-match cases), removing an
-# untracked package is a true no-op, and — the hard safety contract — the
-# hook's own exit code is always 0 even when something inside it breaks, so
-# it can never fail or hang someone's package removal.
+# Regression test for both pacman hooks `pkgundo install-hook` manages:
+# install-time auto-tracking (explicitly installed packages get tracked with
+# zero manual `pkgundo track`, dependency-reason installs are correctly left
+# alone) and the removal-time reminder (single-match and bulk-match cases,
+# removing an untracked package is a true no-op). Also covers the hard
+# safety contract shared by both hooks — their exit code is always 0 even
+# when something inside breaks, so neither can ever fail or hang someone's
+# package install/removal.
 #
 # Usage:
 #   ./pacman-hook-test.sh
@@ -58,15 +60,38 @@ sleep 1
 ssh_vm "$IP" "systemctl is-active pkgundo-daemon" | grep -q active || fail "daemon did not reach active state"
 
 echo
-echo "== [2] pkgundo install-hook: writes a real hook with Exec pointed at this binary =="
+echo "== [2] pkgundo install-hook: writes both real hooks with Exec pointed at this binary =="
 ssh_vm "$IP" "sudo $BIN install-hook"
-ssh_vm "$IP" "test -f /etc/pacman.d/hooks/99-pkgundo-tracked.hook" || fail "install-hook did not write the hook file"
+ssh_vm "$IP" "test -f /etc/pacman.d/hooks/99-pkgundo-tracked.hook" || fail "install-hook did not write the removal hook file"
 ssh_vm "$IP" "grep -q \"Exec = $BIN pacman-hook\" /etc/pacman.d/hooks/99-pkgundo-tracked.hook" \
-    || fail "hook's Exec line was not patched to the real binary path"
-echo "PASS: install-hook wrote a correctly-patched hook file."
+    || fail "removal hook's Exec line was not patched to the real binary path"
+ssh_vm "$IP" "test -f /etc/pacman.d/hooks/98-pkgundo-track-on-install.hook" \
+    || fail "install-hook did not write the install-time auto-track hook file"
+ssh_vm "$IP" "grep -q \"Exec = $BIN pacman-hook-install\" /etc/pacman.d/hooks/98-pkgundo-track-on-install.hook" \
+    || fail "install hook's Exec line was not patched to the real binary path"
+echo "PASS: install-hook wrote both correctly-patched hook files."
 
 echo
-echo "== [3] Removing a package that was never tracked: true no-op (no output, exit 0) =="
+echo "== [3] Auto-track-on-install: explicitly installed packages are tracked with zero manual 'pkgundo track', dependency-reason installs are not =="
+# --asdeps forces pacman's own install-reason bookkeeping to 'dependency'
+# regardless of whether anything actually depends on the package — this is
+# the same field the hook itself checks via 'pacman -Qi', so it's a
+# deterministic way to exercise the skip path without relying on a real
+# dependency graph.
+ssh_vm "$IP" "sudo pacman -S --noconfirm --needed --asdeps fastfetch >/dev/null"
+sleep 1
+ssh_vm "$IP" "$BIN tracked" | grep -q "^fastfetch" \
+    && fail "a dependency-reason install should NOT have been auto-tracked"
+echo "PASS: package installed as a dependency was correctly left untracked."
+
+ssh_vm "$IP" "sudo pacman -S --noconfirm --needed newsboat >/dev/null"
+sleep 1
+ssh_vm "$IP" "$BIN tracked" | grep -q "^newsboat" \
+    || fail "an explicitly installed package should have been auto-tracked without ever calling 'pkgundo track'"
+echo "PASS: explicitly installed package was auto-tracked with zero manual pkgundo commands."
+
+echo
+echo "== [4] Removing a package that was never tracked: true no-op (no output, exit 0) =="
 ssh_vm "$IP" "sudo pacman -S --noconfirm --needed fastfetch >/dev/null"
 set +e
 UNTRACKED_OUT="$(ssh_vm "$IP" "sudo pacman -R --noconfirm fastfetch 2>&1")"
@@ -78,7 +103,11 @@ echo "$UNTRACKED_OUT" | grep -qi "pkgundo was tracking\|tracked apps were just r
 echo "PASS: untracked-package removal produced no reminder and exited cleanly."
 
 echo
-echo "== [4] Single-match case: track a real package, remove it, expect the reminder =="
+echo "== [5] Single-match case: track a real package, remove it, expect the reminder =="
+# The install-hook auto-tracks htop the moment it's installed below (it's
+# an explicit install, same as [3]); the manual '$BIN track htop' call is
+# therefore redundant in practice, kept here only to prove the manual path
+# still works fine layered on top of an already-auto-tracked package.
 ssh_vm "$IP" "sudo pacman -S --noconfirm --needed htop >/dev/null"
 ssh_vm "$IP" "cd ~/pkgundo && $BIN track htop"
 SINGLE_OUT="$(ssh_vm "$IP" "sudo pacman -R --noconfirm htop 2>&1")"
@@ -89,7 +118,7 @@ echo "$SINGLE_OUT" | grep -q "pkgundo untrack htop --rollback --dry-run" || fail
 echo "PASS: single tracked-package removal produced the expected reminder."
 
 echo
-echo "== [5] Bulk-removal case: two tracked packages removed in one transaction, one combined summary =="
+echo "== [6] Bulk-removal case: two tracked packages removed in one transaction, one combined summary =="
 ssh_vm "$IP" "sudo pacman -S --noconfirm --needed fastfetch fortune-mod >/dev/null"
 ssh_vm "$IP" "cd ~/pkgundo && $BIN track fastfetch && $BIN track fortune-mod"
 BULK_OUT="$(ssh_vm "$IP" "sudo pacman -R --noconfirm fastfetch fortune-mod 2>&1")"
@@ -102,7 +131,7 @@ REMINDER_BLOCKS="$(echo "$BULK_OUT" | grep -c "tracked apps were just removed\|p
 echo "PASS: bulk removal of 2 tracked packages produced a single combined summary, not a wall of separate reminders."
 
 echo
-echo "== [6] Exit-code contract: hook must exit 0 even when something inside it breaks =="
+echo "== [7] Exit-code contract: hook must exit 0 even when something inside it breaks =="
 ssh_vm "$IP" "sudo pacman -S --noconfirm --needed newsboat >/dev/null"
 ssh_vm "$IP" "cd ~/pkgundo && $BIN track newsboat"
 # Simulate an internal failure by making the DB temporarily unreadable to
@@ -118,7 +147,7 @@ ssh_vm "$IP" "sudo chmod 644 /var/lib/pkgundo/pkgundo.db"
 echo "PASS: hook failure is swallowed internally — pacman's own exit status is unaffected."
 
 echo
-echo "== [7] DB-lock contention: hook reads consistent data while the daemon is actively capturing for another app =="
+echo "== [8] DB-lock contention: hook reads consistent data while the daemon is actively capturing for another app =="
 ssh_vm "$IP" "printf '#include <unistd.h>\nint main(){sleep(6);return 0;}\n' > /tmp/slow.c && sudo gcc -x c /tmp/slow.c -o /usr/local/bin/slowapp"
 ssh_vm "$IP" "cd ~/pkgundo && $BIN track slowapp"
 ssh_vm "$IP" "sudo pacman -S --noconfirm --needed tree >/dev/null"
@@ -132,14 +161,19 @@ echo "$CONTENTION_OUT" | grep -q "pkgundo was tracking removed package 'tree'" \
 echo "PASS: hook produced a correct reminder while the daemon held an active capture elsewhere."
 
 echo
-echo "== [8] install-hook --remove: hook file gone, subsequent removals produce no reminder =="
+echo "== [9] install-hook --remove: both hook files gone, subsequent install/removal produce no auto-track/reminder =="
 ssh_vm "$IP" "sudo pacman -S --noconfirm --needed htop >/dev/null"
 ssh_vm "$IP" "cd ~/pkgundo && $BIN track htop"
 ssh_vm "$IP" "sudo $BIN install-hook --remove"
-ssh_vm "$IP" "test -f /etc/pacman.d/hooks/99-pkgundo-tracked.hook" && fail "hook file should be gone after install-hook --remove"
+ssh_vm "$IP" "test -f /etc/pacman.d/hooks/99-pkgundo-tracked.hook" && fail "removal hook file should be gone after install-hook --remove"
+ssh_vm "$IP" "test -f /etc/pacman.d/hooks/98-pkgundo-track-on-install.hook" && fail "install hook file should be gone after install-hook --remove"
 POSTREMOVE_OUT="$(ssh_vm "$IP" "sudo pacman -R --noconfirm htop 2>&1")"
 echo "$POSTREMOVE_OUT" | grep -qi "pkgundo was tracking" && fail "expected no reminder once the hook itself is uninstalled"
-echo "PASS: install-hook --remove cleanly disables the reminder."
+ssh_vm "$IP" "sudo pacman -S --noconfirm --needed fortune-mod >/dev/null"
+sleep 1
+ssh_vm "$IP" "$BIN tracked" | grep -q "^fortune-mod" \
+    && fail "expected no auto-tracking once the install hook itself is uninstalled"
+echo "PASS: install-hook --remove cleanly disables both auto-tracking and the removal reminder."
 
 ssh_vm "$IP" "systemctl is-active pkgundo-daemon" | grep -q active || fail "daemon health was affected by hook/CLI-side testing — it never should be"
 echo "PASS: daemon health unaffected throughout — hook and install-hook are both CLI-side, no daemon involvement."

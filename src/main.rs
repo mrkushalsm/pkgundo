@@ -35,7 +35,7 @@ async fn main() -> Result<()> {
     // Print banner — except for the pacman hook, whose output lands inline
     // in someone's `pacman -R` terminal and has no business showing an
     // ASCII banner there.
-    if !matches!(cli.command, Commands::PacmanHook) {
+    if !matches!(cli.command, Commands::PacmanHook | Commands::PacmanHookInstall) {
         print_banner();
     }
 
@@ -85,6 +85,12 @@ async fn main() -> Result<()> {
             // handle_pacman_hook's doc. Any internal error is caught and
             // logged there, never propagated up through this `?`.
             commands::hook::handle_pacman_hook(db_path);
+        }
+        Commands::PacmanHookInstall => {
+            // Same always-exit-0 contract as PacmanHook — this fires on
+            // every `pacman -S`, so it must never make an install look
+            // like it failed.
+            commands::hook::handle_pacman_hook_install(db_path).await;
         }
         Commands::InstallHook { remove } => {
             commands::hook::handle_install_hook(*remove)?;
