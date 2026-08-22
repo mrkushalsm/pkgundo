@@ -19,6 +19,7 @@ use std::io;
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::classifier::classify_path;
@@ -208,7 +209,43 @@ pub struct FanotifyMonitor {
     /// writes) were never affected — this only ever hit exactly the kind of
     /// thread short-lived enough to race a live re-resolve.
     tid_cache: Mutex<HashMap<i32, i32>>,
+    /// Events whose raw reported pid didn't match any entry in
+    /// `active_launches` at read time — buffered here instead of dropped
+    /// outright, since the gap is often just `process_tracker`'s ~50ms
+    /// `/proc` poll not having registered a just-forked descendant yet, not
+    /// a genuinely unrelated process. Retried on every subsequent read
+    /// until either attribution succeeds or `PENDING_RETRY_WINDOW` elapses.
+    /// See `read_events_filtered`'s doc for the full race this closes.
+    pending: Mutex<Vec<PendingEvent>>,
 }
+
+/// A fanotify event that couldn't be attributed to any active launch at
+/// read time. Stores the *raw reported pid* — deliberately not a resolved
+/// tgid — plus a copy of the raw DFID_NAME info record bytes, so a retry is
+/// just a cheap map lookup, no `/proc` read at all. This matters: the
+/// failure mode being closed here is a child process short-lived enough
+/// that it may already be fully exited (and reaped) by the time this event
+/// is read, so a `/proc`-based tgid resolution at buffer time would just
+/// fail immediately for exactly the events that need buffering. `pid` works
+/// anyway because `process_tracker`'s discovery registers a descendant
+/// under this exact same raw pid, live-process confirmation or not.
+struct PendingEvent {
+    mask: u64,
+    pid: i32,
+    info: Vec<u8>,
+    first_seen: Instant,
+}
+
+/// How long an unattributed event is worth retrying. `process_tracker`
+/// polls every 50ms, so this covers several missed ticks' worth of
+/// discovery lag without holding onto events indefinitely.
+const PENDING_RETRY_WINDOW: Duration = Duration::from_millis(500);
+
+/// Hard cap on buffered unattributed events — a safety valve against
+/// unbounded growth if a whole-filesystem mark sees heavy activity from
+/// genuinely unrelated processes while a launch is active (those never
+/// resolve, but still occupy a slot until they expire).
+const PENDING_MAX: usize = 5000;
 
 impl FanotifyMonitor {
     /// Create a new fanotify monitor. Returns error if fanotify unavailable.
@@ -233,6 +270,7 @@ impl FanotifyMonitor {
             fanotify_fd: fd as RawFd,
             pid_attribution: true,
             tid_cache: Mutex::new(HashMap::new()),
+            pending: Mutex::new(Vec::new()),
         })
     }
 
@@ -253,6 +291,61 @@ impl FanotifyMonitor {
                 cache.insert(tid, tgid);
             }
         }
+    }
+
+    /// Buffer an event whose raw pid didn't (yet) match any active launch,
+    /// bounded by `PENDING_MAX` so sustained unrelated filesystem activity
+    /// during a launch can't grow this unboundedly.
+    fn buffer_pending(&self, mask: u64, pid: i32, info: &[u8]) {
+        let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        if pending.len() >= PENDING_MAX {
+            log::debug!("fanotify: pending-event buffer full ({PENDING_MAX}), dropping event for pid={pid}");
+            return;
+        }
+        log::debug!("fanotify: buffering unattributed event for pid={pid} (retry within {PENDING_RETRY_WINDOW:?})");
+        pending.push(PendingEvent { mask, pid, info: info.to_vec(), first_seen: Instant::now() });
+    }
+
+    /// Retry every buffered event against the current `active_launches`
+    /// state, moving newly-resolvable ones into `events`. An entry is
+    /// removed once it either resolves (successfully or not — a stale
+    /// handle at this point won't get fresher by waiting longer) or exceeds
+    /// `PENDING_RETRY_WINDOW`; only a still-unmatched pid within the window
+    /// is kept for another pass. Cheap even with many pending entries: no
+    /// retry here costs more than a map lookup unless it actually resolves.
+    fn retry_pending(
+        &self,
+        active_launches: &Mutex<HashMap<i32, ActiveLaunch>>,
+        events: &mut Vec<(u64, i32, PathBuf, i64)>,
+    ) {
+        let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        if pending.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        pending.retain(|p| {
+            if now.duration_since(p.first_seen) > PENDING_RETRY_WINDOW {
+                return false;
+            }
+            let mount_fd = {
+                let guard = active_launches.lock().unwrap_or_else(|g| g.into_inner());
+                guard.get(&p.pid).map(|l| l.mount_fd)
+            };
+            let Some(mount_fd) = mount_fd else {
+                return true; // still not registered — keep waiting within the window
+            };
+            if let Some(path) = Self::resolve_info_record(mount_fd, &p.info) {
+                let guard = active_launches.lock().unwrap_or_else(|g| g.into_inner());
+                if let Some(txid) = attribute_event(p.pid, &path, &guard) {
+                    log::debug!(
+                        "fanotify: retry resolved buffered event for pid={} -> {} (waited {:?})",
+                        p.pid, path.display(), now.duration_since(p.first_seen)
+                    );
+                    events.push((p.mask, p.pid, path, txid));
+                }
+            }
+            false
+        });
     }
 
     /// Mark filesystem paths for monitoring
@@ -348,12 +441,23 @@ impl FanotifyMonitor {
     /// pid from `active_launches` — before already-generated kernel events
     /// for that pid had been drained, silently dropping them from
     /// `attribute_event`'s filtering on the next read.
+    ///
+    /// A second, narrower race lives one level up from that one: a *new*
+    /// descendant process (not a worker thread — an actual forked child,
+    /// e.g. a script's `ln`/`cp`/interpreter invocation) can perform its own
+    /// write before `process_tracker`'s ~50ms `/proc` poll has discovered it
+    /// and registered it in `active_launches` at all. Unlike the tid/tgid
+    /// case above, there is no cache to consult — the pid is a real, live
+    /// process, but attribution genuinely doesn't know about it *yet*. Such
+    /// events are buffered (see `pending`) and retried on subsequent calls
+    /// instead of being dropped the instant this happens to run first.
     fn read_events_filtered(
         &self,
         active_launches: &Mutex<HashMap<i32, ActiveLaunch>>,
     ) -> (Vec<(u64, i32, PathBuf, i64)>, bool) {
         let mut buf = [0u8; 65536];
         let mut events = Vec::new();
+        self.retry_pending(active_launches, &mut events);
 
         let n = unsafe {
             libc::read(self.fanotify_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
@@ -396,9 +500,9 @@ impl FanotifyMonitor {
                 let guard = active_launches.lock().unwrap_or_else(|p| p.into_inner());
                 guard.get(&meta.pid).map(|l| l.mount_fd)
             };
-            let resolved = if let Some(mount_fd) = cheap_mount_fd {
-                Some((meta.pid, mount_fd))
-            } else {
+            let mut resolved = cheap_mount_fd.map(|mount_fd| (meta.pid, mount_fd));
+
+            if resolved.is_none() {
                 // fanotify's reported pid is actually the tid of whichever
                 // thread performed the I/O — a worker thread performing a
                 // tracked launch's own write (e.g. Node's libuv threadpool,
@@ -417,26 +521,36 @@ impl FanotifyMonitor {
                     let cache = self.tid_cache.lock().unwrap_or_else(|p| p.into_inner());
                     cache.get(&meta.pid).copied()
                 };
-                cached_tgid.or_else(|| resolve_tgid(meta.pid)).and_then(|tgid| {
+                if let Some(tgid) = cached_tgid.or_else(|| resolve_tgid(meta.pid)) {
                     let guard = active_launches.lock().unwrap_or_else(|p| p.into_inner());
-                    guard.get(&tgid).map(|l| (tgid, l.mount_fd))
-                })
-            };
-            if let Some((tgid, mount_fd)) = resolved {
-                let mut info_offset = offset + meta.metadata_len as usize;
-                let mut path = None;
-                while info_offset + 4 <= event_end {
-                    let info_type = buf[info_offset];
-                    let info_len =
-                        u16::from_ne_bytes([buf[info_offset + 2], buf[info_offset + 3]]) as usize;
-                    if info_len == 0 || info_offset + info_len > event_end {
-                        break;
+                    if let Some(l) = guard.get(&tgid) {
+                        resolved = Some((tgid, l.mount_fd));
                     }
-                    if info_type == FAN_EVENT_INFO_TYPE_DFID_NAME {
-                        path = Self::resolve_dfid_name(mount_fd, &buf, info_offset, info_len);
-                    }
-                    info_offset += info_len;
                 }
+            }
+
+            // Info records (parent-dir handle + filename) follow the fixed
+            // metadata header — located unconditionally, since both the
+            // immediate-resolution path below and the buffering path need
+            // the same bytes.
+            let mut info_offset = offset + meta.metadata_len as usize;
+            let mut info_slice = None;
+            while info_offset + 4 <= event_end {
+                let info_type = buf[info_offset];
+                let info_len =
+                    u16::from_ne_bytes([buf[info_offset + 2], buf[info_offset + 3]]) as usize;
+                if info_len == 0 || info_offset + info_len > event_end {
+                    break;
+                }
+                if info_type == FAN_EVENT_INFO_TYPE_DFID_NAME {
+                    info_slice = Some((info_offset, info_len));
+                }
+                info_offset += info_len;
+            }
+
+            if let Some((tgid, mount_fd)) = resolved {
+                let path = info_slice
+                    .and_then(|(io, il)| Self::resolve_info_record(mount_fd, &buf[io..io + il]));
 
                 if let Some(p) = path {
                     // Re-check (not just reuse the earlier lookup) since the
@@ -448,6 +562,23 @@ impl FanotifyMonitor {
                     if let Some(txid) = attribute_event(tgid, &p, &guard) {
                         events.push((meta.mask, tgid, p, txid));
                     }
+                }
+            } else if let Some((io, il)) = info_slice {
+                // Neither the raw reported pid nor (if it resolved at all)
+                // its tgid currently match a registered launch. Buffer
+                // using the *raw* pid — not a resolved tgid — since a
+                // short-lived descendant (e.g. a script's `ln`/`cp`
+                // invocation) can fully exit and be reaped before this
+                // event is even read, which would make a tgid lookup here
+                // fail every time for exactly the events that need
+                // buffering. `process_tracker`'s discovery registers a
+                // descendant under this exact raw pid regardless of
+                // whether the process is still alive by the time that
+                // happens, so retrying against it needs no `/proc` read at
+                // all. Skipped while no launch is active at all, so an
+                // idle daemon never pays anything for this.
+                if !active_launches.lock().unwrap_or_else(|p| p.into_inner()).is_empty() {
+                    self.buffer_pending(meta.mask, meta.pid, &buf[io..io + il]);
                 }
             }
 
@@ -527,7 +658,7 @@ impl FanotifyMonitor {
                 }
                 saw_info_record = true;
                 if info_type == FAN_EVENT_INFO_TYPE_DFID_NAME {
-                    path = Self::resolve_dfid_name(mount_fd, &buf, info_offset, info_len);
+                    path = Self::resolve_info_record(mount_fd, &buf[info_offset..info_offset + info_len]);
                 }
                 info_offset += info_len;
             }
@@ -551,21 +682,25 @@ impl FanotifyMonitor {
 
     /// Resolve a FAN_EVENT_INFO_TYPE_DFID_NAME info record into a real path.
     /// Layout: info_header(4) + fsid(8) + file_handle{handle_bytes(4), handle_type(4),
-    /// f_handle[handle_bytes]} + NUL-terminated name.
-    fn resolve_dfid_name(mount_fd: RawFd, buf: &[u8], info_offset: usize, info_len: usize) -> Option<PathBuf> {
-        let handle_off = info_offset + 12;
-        if handle_off + 8 > buf.len() {
-            log::warn!("fanotify: resolve_dfid_name: handle_off out of bounds");
+    /// f_handle[handle_bytes]} + NUL-terminated name. `info` is the raw record
+    /// itself (already sliced out of the read buffer at `info_offset..info_offset+info_len`
+    /// by the caller) — taking an owned/borrowed slice rather than
+    /// `(buf, info_offset, info_len)` lets `PendingEvent` retry resolution
+    /// later from a copy of these same bytes, once the original read
+    /// buffer has long since been overwritten by a subsequent read().
+    fn resolve_info_record(mount_fd: RawFd, info: &[u8]) -> Option<PathBuf> {
+        let handle_off = 12;
+        if handle_off + 8 > info.len() {
+            log::warn!("fanotify: resolve_info_record: handle_off out of bounds");
             return None;
         }
         let handle_bytes =
-            u32::from_ne_bytes(buf.get(handle_off..handle_off + 4)?.try_into().ok()?) as usize;
+            u32::from_ne_bytes(info.get(handle_off..handle_off + 4)?.try_into().ok()?) as usize;
         let name_off = handle_off + 8 + handle_bytes;
-        let info_end = info_offset + info_len;
-        if name_off > info_end || info_end > buf.len() {
+        if name_off > info.len() {
             log::warn!(
-                "fanotify: resolve_dfid_name: name_off {} out of bounds (info_end={}, buf.len={}, handle_bytes={})",
-                name_off, info_end, buf.len(), handle_bytes
+                "fanotify: resolve_info_record: name_off {} out of bounds (info.len={}, handle_bytes={})",
+                name_off, info.len(), handle_bytes
             );
             return None;
         }
@@ -573,7 +708,7 @@ impl FanotifyMonitor {
         // The kernel-provided bytes at handle_off are already laid out exactly
         // like `struct file_handle` (handle_bytes, handle_type, f_handle[]),
         // so we can pass a pointer straight into the read buffer.
-        let handle_ptr = buf[handle_off..].as_ptr() as *mut libc::c_void;
+        let handle_ptr = info[handle_off..].as_ptr() as *mut libc::c_void;
         let dir_fd = unsafe {
             libc::syscall(
                 libc::SYS_open_by_handle_at,
@@ -600,7 +735,7 @@ impl FanotifyMonitor {
         unsafe { libc::close(dir_fd as i32) };
         let dir_path = dir_path?;
 
-        let name_bytes = &buf[name_off..info_end];
+        let name_bytes = &info[name_off..];
         let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
         let name = match std::str::from_utf8(&name_bytes[..name_end]) {
             Ok(n) => n,
@@ -858,6 +993,82 @@ mod tests {
     #[test]
     fn scan_thread_ids_of_nonexistent_tgid_is_empty() {
         assert!(scan_thread_ids(i32::MAX - 1).is_empty());
+    }
+
+    #[test]
+    fn buffer_pending_respects_the_cap() {
+        let monitor = match FanotifyMonitor::try_new(0) {
+            Ok(m) => m,
+            Err(_) => return, // fanotify unavailable in this sandbox — nothing to test
+        };
+        for i in 0..(PENDING_MAX + 10) {
+            monitor.buffer_pending(0, i as i32, &[]);
+        }
+        assert_eq!(monitor.pending.lock().unwrap().len(), PENDING_MAX);
+    }
+
+    #[test]
+    fn retry_pending_drops_expired_entries_without_emitting_them() {
+        let monitor = match FanotifyMonitor::try_new(0) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        {
+            let mut pending = monitor.pending.lock().unwrap();
+            pending.push(PendingEvent {
+                mask: 0,
+                pid: 999_999,
+                info: vec![],
+                first_seen: Instant::now() - PENDING_RETRY_WINDOW - Duration::from_millis(50),
+            });
+        }
+        let active_launches = Mutex::new(HashMap::new());
+        let mut events = Vec::new();
+        monitor.retry_pending(&active_launches, &mut events);
+        assert!(monitor.pending.lock().unwrap().is_empty(), "expired entry must be dropped");
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn retry_pending_keeps_waiting_while_its_pid_is_still_unregistered() {
+        let monitor = match FanotifyMonitor::try_new(0) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        {
+            let mut pending = monitor.pending.lock().unwrap();
+            pending.push(PendingEvent { mask: 0, pid: 4242, info: vec![], first_seen: Instant::now() });
+        }
+        let active_launches = Mutex::new(HashMap::new()); // 4242 never registered
+        let mut events = Vec::new();
+        monitor.retry_pending(&active_launches, &mut events);
+        assert_eq!(
+            monitor.pending.lock().unwrap().len(), 1,
+            "still within the retry window and never resolved — must keep waiting, not drop"
+        );
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn retry_pending_consumes_an_entry_once_its_pid_is_registered() {
+        let monitor = match FanotifyMonitor::try_new(0) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        {
+            let mut pending = monitor.pending.lock().unwrap();
+            // Garbage info bytes: can't actually resolve to a real path, but
+            // that's not what this test is proving — it's that a *matched*
+            // tgid stops being retried after one attempt instead of being
+            // retried forever just because this particular handle was bogus.
+            pending.push(PendingEvent { mask: 0, pid: 4242, info: vec![0u8; 4], first_seen: Instant::now() });
+        }
+        let mut map = HashMap::new();
+        map.insert(4242, launch(1, "/tmp"));
+        let active_launches = Mutex::new(map);
+        let mut events = Vec::new();
+        monitor.retry_pending(&active_launches, &mut events);
+        assert!(monitor.pending.lock().unwrap().is_empty(), "matched tgid must be consumed, not retried again");
     }
 
     #[test]
