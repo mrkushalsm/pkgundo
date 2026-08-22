@@ -46,6 +46,20 @@ impl ArchiveManager {
         Path::new(&self.root).join(txid.to_string()).join(rel)
     }
 
+    /// The metadata sidecar path for an archived file at `dest`. Appends a
+    /// suffix rather than using `Path::with_extension`, which replaces
+    /// whatever follows the *last* `.` in the filename — for a name like
+    /// `<hash>.cache-9`, that silently collides with `<hash>.cache-10`,
+    /// `<hash>.cache-11`, etc. (all of them replace to `<hash>.pkgundo-
+    /// meta.json`), each archive_file call overwriting the previous file's
+    /// metadata. Appending instead guarantees a distinct sidecar for every
+    /// distinct `dest`, regardless of how many dots its own filename has.
+    fn meta_path_for(dest: &Path) -> std::path::PathBuf {
+        let mut file_name = dest.file_name().unwrap_or_default().to_os_string();
+        file_name.push(".pkgundo-meta.json");
+        dest.with_file_name(file_name)
+    }
+
     /// Archive a file: copy it to the archive location and record metadata
     pub fn archive_file(
         &self,
@@ -111,7 +125,7 @@ impl ArchiveManager {
         };
 
         // Write JSON metadata alongside archive
-        let meta_path = dest.with_extension("pkgundo-meta.json");
+        let meta_path = Self::meta_path_for(&dest);
         let json = serde_json::to_string_pretty(&archive_meta)?;
         fs::write(&meta_path, json).context("Failed to write archive metadata")?;
 
@@ -201,7 +215,7 @@ impl ArchiveManager {
     /// added) just means recovery falls back to root ownership, logged, not
     /// a failure of the recovery itself.
     fn restore_ownership(archive_src: &Path, dest: &Path) {
-        let meta_path = archive_src.with_extension("pkgundo-meta.json");
+        let meta_path = Self::meta_path_for(archive_src);
         let meta: ArchiveMetadata = match fs::read_to_string(&meta_path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
@@ -336,5 +350,45 @@ mod tests {
 
         // Must not panic or error when the sidecar is missing.
         ArchiveManager::restore_ownership(&archive_src, &dest);
+    }
+
+    #[test]
+    fn distinct_files_sharing_everything_before_the_last_dot_get_distinct_metadata() {
+        // A real case this hit: fontconfig's own cache files, named
+        // `<hash>.cache-9`, `<hash>.cache-10`, `<hash>.cache-11` — these all
+        // share the same `Path::with_extension` result, which is exactly
+        // the bug `meta_path_for` fixes by appending instead of replacing.
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = open_test_db();
+        let mgr = ArchiveManager::with_root(tmp.path().join("archives").to_string_lossy().to_string());
+
+        let src_dir = tmp.path().join("home");
+        fs::create_dir_all(&src_dir).unwrap();
+        let file_a = src_dir.join("hash.cache-9");
+        let file_b = src_dir.join("hash.cache-10");
+        fs::write(&file_a, b"nine").unwrap();
+        fs::write(&file_b, b"ten").unwrap();
+        fs::set_permissions(&file_a, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&file_b, fs::Permissions::from_mode(0o640)).unwrap();
+
+        mgr.archive_file(&conn, 1, &file_a.to_string_lossy(), false).unwrap();
+        mgr.archive_file(&conn, 1, &file_b.to_string_lossy(), false).unwrap();
+
+        // Both archived copies and both metadata sidecars must exist
+        // independently — none of archive_file's second call for file_b
+        // should have overwritten file_a's copy or its metadata.
+        let archived_a = mgr.archive_path_for(1, &file_a.to_string_lossy());
+        let archived_b = mgr.archive_path_for(1, &file_b.to_string_lossy());
+        assert_eq!(fs::read(&archived_a).unwrap(), b"nine");
+        assert_eq!(fs::read(&archived_b).unwrap(), b"ten");
+
+        fs::remove_file(&file_a).unwrap();
+        fs::remove_file(&file_b).unwrap();
+        mgr.recover_archive(&conn, 1).unwrap();
+
+        let mode_a = fs::metadata(&file_a).unwrap().permissions().mode() & 0o7777;
+        let mode_b = fs::metadata(&file_b).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode_a, 0o600, "file_a's own mode must survive, not file_b's");
+        assert_eq!(mode_b, 0o640, "file_b's own mode must survive, not file_a's");
     }
 }
