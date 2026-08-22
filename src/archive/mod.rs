@@ -17,6 +17,13 @@ pub struct ArchiveMetadata {
     pub uid: Option<u32>,
     pub gid: Option<u32>,
     pub mode: Option<u32>,
+    /// Set only when the original path was a symlink — its link target,
+    /// so `recover_archive` can recreate the symlink itself. A symlink has
+    /// no file content for `fs::copy` to preserve; without this the entire
+    /// symlink (and whatever it pointed to knowing) is unrecoverable the
+    /// moment the original is removed.
+    #[serde(default)]
+    pub symlink_target: Option<String>,
 }
 
 /// Archive manager: handles preserving user-modified files before rollback,
@@ -83,22 +90,26 @@ impl ArchiveManager {
                 .context(format!("Failed to create archive dir: {}", parent.display()))?;
         }
 
-        // Copy file (not symlink target) to archive
-        if src.is_symlink() {
+        // A symlink has no file content for fs::copy to preserve — its
+        // target string *is* its content. Store that in metadata instead
+        // (recover_archive recreates the symlink from it); there is
+        // nothing to write at `dest` itself.
+        let symlink_target = if src.is_symlink() {
             let target = fs::read_link(src)?;
-            // Store symlink info in metadata, don't copy symlink itself
             log::debug!(
                 "ArchiveManager: archiving symlink {} -> {}",
                 original_path,
                 target.display()
             );
+            Some(target.to_string_lossy().to_string())
         } else {
             fs::copy(src, &dest).context(format!(
                 "Failed to copy {} to archive {}",
                 original_path,
                 dest.display()
             ))?;
-        }
+            None
+        };
 
         // Capture metadata
         let meta = fs::symlink_metadata(src).ok();
@@ -122,6 +133,7 @@ impl ArchiveManager {
                 use std::os::unix::fs::MetadataExt;
                 m.mode()
             }),
+            symlink_target,
         };
 
         // Write JSON metadata alongside archive
@@ -170,6 +182,39 @@ impl ArchiveManager {
             let src = Path::new(archive_path);
             let dest = Path::new(original_path);
 
+            // A symlink was never copied as file content in the first
+            // place (see archive_file) — its target lives only in the
+            // metadata sidecar. Check for that before the plain-file
+            // `src.exists()` path below, which would otherwise always
+            // report a symlink entry as "missing" (nothing was ever
+            // written at `src` for one) and silently skip recovering it.
+            if let Some(meta) = Self::read_metadata(src) {
+                if let Some(target) = meta.symlink_target {
+                    if let Some(parent) = dest.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    let _ = fs::remove_file(dest); // dest may already exist (e.g. re-recovering)
+                    match std::os::unix::fs::symlink(&target, dest) {
+                        Ok(()) => {
+                            log::info!(
+                                "ArchiveManager: recovered symlink {} -> {} from archive",
+                                original_path,
+                                target
+                            );
+                            recovered.push(original_path.clone());
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "ArchiveManager: failed to recreate symlink {}: {}",
+                                original_path,
+                                e
+                            );
+                        }
+                    }
+                    continue;
+                }
+            }
+
             if !src.exists() {
                 log::warn!(
                     "ArchiveManager: archive file missing: {}",
@@ -214,17 +259,19 @@ impl ArchiveManager {
     /// unparseable sidecar (e.g. an archive made before this metadata was
     /// added) just means recovery falls back to root ownership, logged, not
     /// a failure of the recovery itself.
-    fn restore_ownership(archive_src: &Path, dest: &Path) {
+    /// Read and parse `archive_src`'s metadata sidecar, if it exists.
+    fn read_metadata(archive_src: &Path) -> Option<ArchiveMetadata> {
         let meta_path = Self::meta_path_for(archive_src);
-        let meta: ArchiveMetadata = match fs::read_to_string(&meta_path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-        {
+        fs::read_to_string(&meta_path).ok().and_then(|s| serde_json::from_str(&s).ok())
+    }
+
+    fn restore_ownership(archive_src: &Path, dest: &Path) {
+        let meta = match Self::read_metadata(archive_src) {
             Some(m) => m,
             None => {
                 log::debug!(
                     "ArchiveManager: no archive metadata at {}, leaving recovered file's ownership as-is",
-                    meta_path.display()
+                    Self::meta_path_for(archive_src).display()
                 );
                 return;
             }
@@ -390,5 +437,36 @@ mod tests {
         let mode_b = fs::metadata(&file_b).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode_a, 0o600, "file_a's own mode must survive, not file_b's");
         assert_eq!(mode_b, 0o640, "file_b's own mode must survive, not file_a's");
+    }
+
+    /// Reproduces the real bug found on a live VM: fontconfig's numbered
+    /// cache candidate files (`<hash>.cache-9`, etc.) turned out to be
+    /// symlinks, not regular files. `archive_file`'s symlink branch used to
+    /// `fs::read_link` the target and then just discard it — no content
+    /// ever got written to the archive destination, yet the function still
+    /// logged (and reported) success. Once the original was removed, the
+    /// symlink was gone with no way back.
+    #[test]
+    fn symlinks_are_actually_recoverable_not_silently_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = open_test_db();
+        let mgr = ArchiveManager::with_root(tmp.path().join("archives").to_string_lossy().to_string());
+
+        let real_target = tmp.path().join("real-cache-blob");
+        fs::write(&real_target, b"shared cache content").unwrap();
+        let link = tmp.path().join("hash.cache-9");
+        std::os::unix::fs::symlink(&real_target, &link).unwrap();
+
+        mgr.archive_file(&conn, 1, &link.to_string_lossy(), false).unwrap();
+
+        fs::remove_file(&link).unwrap();
+        assert!(!link.exists(), "sanity: original symlink is really gone");
+
+        let recovered = mgr.recover_archive(&conn, 1).unwrap();
+        assert_eq!(recovered, vec![link.to_string_lossy().to_string()]);
+
+        let meta = fs::symlink_metadata(&link).unwrap();
+        assert!(meta.file_type().is_symlink(), "recovered entry must be a real symlink, not a copied file");
+        assert_eq!(fs::read_link(&link).unwrap(), real_target, "recovered symlink must point at the original target");
     }
 }
