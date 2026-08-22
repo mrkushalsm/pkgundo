@@ -196,6 +196,7 @@ impl ArchiveManager {
                     let _ = fs::remove_file(dest); // dest may already exist (e.g. re-recovering)
                     match std::os::unix::fs::symlink(&target, dest) {
                         Ok(()) => {
+                            Self::restore_ownership(src, dest);
                             log::info!(
                                 "ArchiveManager: recovered symlink {} -> {} from archive",
                                 original_path,
@@ -276,6 +277,33 @@ impl ArchiveManager {
                 return;
             }
         };
+
+        // `chown`/`chmod` both dereference symlinks, so calling them on a
+        // recovered symlink's path would silently mutate its *target*
+        // instead — leaving the symlink itself (still just-created by
+        // `recover_archive`, owned by whoever ran `recover`) untouched, and
+        // corrupting the target's already-correctly-restored ownership/mode
+        // in the process. Symlink permission bits are meaningless on Linux
+        // anyway, so mode restoration only applies to real files.
+        if dest.is_symlink() {
+            if let (Some(uid), Some(gid)) = (meta.uid, meta.gid) {
+                let c_path = match std::ffi::CString::new(dest.to_string_lossy().as_bytes()) {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                let ret = unsafe { libc::lchown(c_path.as_ptr(), uid, gid) };
+                if ret != 0 {
+                    log::warn!(
+                        "ArchiveManager: failed to restore symlink ownership ({}:{}) on {}: {}",
+                        uid,
+                        gid,
+                        dest.display(),
+                        std::io::Error::last_os_error()
+                    );
+                }
+            }
+            return;
+        }
 
         if let Some(mode) = meta.mode {
             use std::os::unix::fs::PermissionsExt;
@@ -468,5 +496,35 @@ mod tests {
         let meta = fs::symlink_metadata(&link).unwrap();
         assert!(meta.file_type().is_symlink(), "recovered entry must be a real symlink, not a copied file");
         assert_eq!(fs::read_link(&link).unwrap(), real_target, "recovered symlink must point at the original target");
+    }
+
+    /// `chown`/`chmod` both dereference symlinks — calling either on a
+    /// recovered symlink's own path would silently mutate whatever it
+    /// points at instead. Proven here by giving the symlink's stored mode
+    /// (0o777, decoded from a real `S_IFLNK`-tagged `st_mode`) a value that
+    /// differs from the target's own real mode (0o640): if
+    /// `restore_ownership` ever dereferences the symlink path again, the
+    /// target's mode gets stomped to 0o777.
+    #[test]
+    fn restoring_a_recovered_symlink_never_touches_its_targets_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = open_test_db();
+        let mgr = ArchiveManager::with_root(tmp.path().join("archives").to_string_lossy().to_string());
+
+        let real_target = tmp.path().join("real-target.txt");
+        fs::write(&real_target, b"content").unwrap();
+        fs::set_permissions(&real_target, fs::Permissions::from_mode(0o640)).unwrap();
+
+        let link = tmp.path().join("the-link");
+        std::os::unix::fs::symlink(&real_target, &link).unwrap();
+
+        mgr.archive_file(&conn, 1, &link.to_string_lossy(), false).unwrap();
+        fs::remove_file(&link).unwrap();
+
+        mgr.recover_archive(&conn, 1).unwrap();
+
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        let target_mode = fs::metadata(&real_target).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(target_mode, 0o640, "recovering the symlink must not stomp its target's own mode");
     }
 }
