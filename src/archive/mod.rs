@@ -170,6 +170,7 @@ impl ArchiveManager {
 
             match fs::copy(src, dest) {
                 Ok(_) => {
+                    Self::restore_ownership(src, dest);
                     log::info!(
                         "ArchiveManager: recovered {} from archive",
                         original_path
@@ -187,6 +188,57 @@ impl ArchiveManager {
         }
 
         Ok(recovered)
+    }
+
+    /// Re-apply the original owner/group/mode captured at archive time
+    /// (stored in the `.pkgundo-meta.json` sidecar next to `archive_src`)
+    /// onto `dest` after `recover_archive` copies its content back.
+    /// `fs::copy` alone leaves a freshly-recovered file owned by whichever
+    /// user ran `pkgundo recover` (root, since the command requires it) —
+    /// without this, a recovered file in someone's home directory would
+    /// silently belong to root instead of them. Best-effort: a missing or
+    /// unparseable sidecar (e.g. an archive made before this metadata was
+    /// added) just means recovery falls back to root ownership, logged, not
+    /// a failure of the recovery itself.
+    fn restore_ownership(archive_src: &Path, dest: &Path) {
+        let meta_path = archive_src.with_extension("pkgundo-meta.json");
+        let meta: ArchiveMetadata = match fs::read_to_string(&meta_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+        {
+            Some(m) => m,
+            None => {
+                log::debug!(
+                    "ArchiveManager: no archive metadata at {}, leaving recovered file's ownership as-is",
+                    meta_path.display()
+                );
+                return;
+            }
+        };
+
+        if let Some(mode) = meta.mode {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = fs::set_permissions(dest, std::fs::Permissions::from_mode(mode & 0o7777)) {
+                log::warn!("ArchiveManager: failed to restore mode on {}: {}", dest.display(), e);
+            }
+        }
+
+        if let (Some(uid), Some(gid)) = (meta.uid, meta.gid) {
+            let c_path = match std::ffi::CString::new(dest.to_string_lossy().as_bytes()) {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            let ret = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
+            if ret != 0 {
+                log::warn!(
+                    "ArchiveManager: failed to restore ownership ({}:{}) on {}: {}",
+                    uid,
+                    gid,
+                    dest.display(),
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
     }
 
     /// List all archives for a transaction
@@ -227,4 +279,62 @@ pub struct ArchiveEntry {
     pub archive_path: String,
     pub modified_after_install: bool,
     pub archived_at: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn open_test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE archives (
+                id INTEGER PRIMARY KEY,
+                txid INTEGER NOT NULL,
+                original_path TEXT NOT NULL,
+                archive_path TEXT NOT NULL,
+                modified_after_install INTEGER NOT NULL,
+                archived_at TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn recover_restores_the_mode_captured_at_archive_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = open_test_db();
+        let mgr = ArchiveManager::with_root(tmp.path().join("archives").to_string_lossy().to_string());
+
+        let original = tmp.path().join("original.conf");
+        fs::write(&original, b"hello").unwrap();
+        fs::set_permissions(&original, fs::Permissions::from_mode(0o640)).unwrap();
+
+        mgr.archive_file(&conn, 1, &original.to_string_lossy(), false).unwrap();
+
+        // Simulate the file having been removed, then recovered with
+        // whatever default mode `fs::copy` happens to produce, rather than
+        // the original 0o640 — this is the gap `restore_ownership` closes.
+        fs::remove_file(&original).unwrap();
+
+        let recovered = mgr.recover_archive(&conn, 1).unwrap();
+        assert_eq!(recovered, vec![original.to_string_lossy().to_string()]);
+
+        let restored_mode = fs::metadata(&original).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(restored_mode, 0o640, "recover_archive should re-apply the original mode, not whatever fs::copy defaulted to");
+    }
+
+    #[test]
+    fn restore_ownership_is_a_safe_noop_without_a_metadata_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive_src = tmp.path().join("some_file"); // no matching .pkgundo-meta.json
+        fs::write(&archive_src, b"x").unwrap();
+        let dest = tmp.path().join("dest_file");
+        fs::write(&dest, b"x").unwrap();
+
+        // Must not panic or error when the sidecar is missing.
+        ArchiveManager::restore_ownership(&archive_src, &dest);
+    }
 }
