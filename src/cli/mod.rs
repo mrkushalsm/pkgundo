@@ -156,4 +156,15 @@ pub enum Commands {
         #[arg(long, default_value = "false")]
         remove: bool,
     },
+
+    /// One-shot setup for a fresh pkgundo install: installs, enables, and
+    /// starts the daemon's systemd unit, then installs the package-manager
+    /// hooks (equivalent to running InstallHook). Requires root. With
+    /// --remove, undoes both: stops/disables/removes the daemon unit and
+    /// removes the hooks. Example: sudo pkgundo setup
+    Setup {
+        /// Undo setup instead of performing it
+        #[arg(long, default_value = "false")]
+        remove: bool,
+    },
 }

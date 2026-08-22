@@ -107,6 +107,9 @@ async fn main() -> Result<()> {
         Commands::InstallHook { remove } => {
             commands::hook::handle_install_hook(*remove)?;
         }
+        Commands::Setup { remove } => {
+            commands::setup::handle_setup(*remove)?;
+        }
     }
 
     Ok(())
