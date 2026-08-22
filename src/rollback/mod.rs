@@ -850,4 +850,92 @@ mod tests {
         let selected: HashSet<PathBuf> = [PathBuf::from("/home/alice/.config/app")].into_iter().collect();
         assert!(mutation_passes_group_filter(Path::new("/usr/bin/whatever"), &Some(selected)));
     }
+
+    /// Reproduces the real fontconfig cache-regeneration pattern that a live
+    /// VM test exposed: several sibling files sharing everything up to
+    /// their last dot (`<hash>.cache-9`, `<hash>.cache-10`, `<hash>.cache-11`,
+    /// `<hash>.cache-12`), where the earlier temp/lock/new files in an
+    /// atomic-write sequence are already gone from disk by rollback time
+    /// (the app cleaned them up itself) but a few bare `create`-only
+    /// siblings are still genuinely present when `execute()` runs. On a
+    /// live VM, three such files were archived successfully (logged,
+    /// confirmed in the `archives` DB table) but their actual archived
+    /// *content* was later found missing from disk — this test drives the
+    /// exact same shape through the real engine to find out why.
+    #[test]
+    fn archived_content_for_every_sibling_survives_a_real_rollback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home").join("pkgundo");
+        let cache_dir = home.join(".cache").join("fontconfig");
+        fs::create_dir_all(&cache_dir).unwrap();
+        let archive_root = tmp.path().join("archives").to_string_lossy().to_string();
+        let db_path = tmp.path().join("pkgundo.db");
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        let conn = crate::db::init_db(&db_path_str).unwrap();
+        let txid = crate::transaction::create_transaction(&conn, "[tracked] repro", &[]).unwrap();
+
+        let mut insert = |op: &str, path: &Path| {
+            let record = crate::journal::MutationRecord {
+                id: None,
+                txid,
+                pid: Some(1234),
+                operation: op.to_string(),
+                path: path.to_string_lossy().to_string(),
+                timestamp: chrono::Utc::now(),
+                file_category: "Cache".to_string(),
+                pre_hash: None,
+                post_hash: None,
+            };
+            crate::journal::append_mutation(&conn, &record).unwrap();
+        };
+
+        // The atomic-write dance for one "final" file: temp -> lock -> new
+        // -> rename_to. All of these except the final name are gone from
+        // disk by rollback time, exactly like the real fontconfig case.
+        let final_file = cache_dir.join("CACHEDIR.TAG");
+        fs::write(&final_file, b"final content").unwrap();
+        insert("create", &cache_dir.join("CACHEDIR.TAG.TMP-xxx"));
+        insert("modify", &cache_dir.join("CACHEDIR.TAG.TMP-xxx"));
+        insert("create", &cache_dir.join("CACHEDIR.TAG.LCK"));
+        insert("create", &cache_dir.join("CACHEDIR.TAG.NEW"));
+        insert("modify", &cache_dir.join("CACHEDIR.TAG.NEW"));
+        insert("rename_to", &final_file);
+
+        // The mysterious bare-`create`-only siblings, still genuinely
+        // present on disk at rollback time (unlike the temp files above).
+        let siblings: Vec<PathBuf> = ["hash.cache-9", "hash.cache-10", "hash.cache-11"]
+            .iter()
+            .map(|name| cache_dir.join(name))
+            .collect();
+        for (i, sib) in siblings.iter().enumerate() {
+            fs::write(sib, format!("content-{}", i)).unwrap();
+            insert("create", sib);
+        }
+
+        let engine = RollbackEngine::new(txid, RollbackMode::Conservative, false, &db_path_str)
+            .with_archive_root(archive_root.clone())
+            .with_home_cleanup(true);
+        let report = engine.execute().unwrap();
+
+        assert!(report.failed.is_empty(), "expected no failures, got {:?}", report.failed);
+
+        let archive_mgr = ArchiveManager::with_root(archive_root);
+        for (i, sib) in siblings.iter().enumerate() {
+            assert!(!sib.exists(), "original {} should have been removed", sib.display());
+            let archived_path = archive_mgr.archive_path_for(txid, &sib.to_string_lossy());
+            assert!(
+                archived_path.exists(),
+                "archived copy for {} should exist at {}",
+                sib.display(),
+                archived_path.display()
+            );
+            assert_eq!(
+                fs::read_to_string(&archived_path).unwrap(),
+                format!("content-{}", i),
+                "archived copy for {} has the wrong content",
+                sib.display()
+            );
+        }
+    }
 }
