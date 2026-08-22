@@ -169,9 +169,16 @@ ssh_vm "$IP" "test -f /etc/pacman.d/hooks/99-pkgundo-tracked.hook" && fail "remo
 ssh_vm "$IP" "test -f /etc/pacman.d/hooks/98-pkgundo-track-on-install.hook" && fail "install hook file should be gone after install-hook --remove"
 POSTREMOVE_OUT="$(ssh_vm "$IP" "sudo pacman -R --noconfirm htop 2>&1")"
 echo "$POSTREMOVE_OUT" | grep -qi "pkgundo was tracking" && fail "expected no reminder once the hook itself is uninstalled"
-ssh_vm "$IP" "sudo pacman -S --noconfirm --needed fortune-mod >/dev/null"
+# Deliberately a package name never touched anywhere earlier in this script:
+# fastfetch/fortune-mod/newsboat/tree/htop were all tracked in earlier steps
+# and the removal hook never auto-untracks (detection-only, by design), so
+# any of those would still show status=tracking from a *previous* step
+# regardless of whether install-hook --remove actually works, making this
+# check a false pass/fail either way. cowsay is fresh, so a tracked-apps hit
+# here can only come from the install hook actually re-firing.
+ssh_vm "$IP" "sudo pacman -S --noconfirm --needed cowsay >/dev/null"
 sleep 1
-ssh_vm "$IP" "$BIN tracked" | grep -q "^fortune-mod" \
+ssh_vm "$IP" "$BIN tracked" | grep -q "^cowsay" \
     && fail "expected no auto-tracking once the install hook itself is uninstalled"
 echo "PASS: install-hook --remove cleanly disables both auto-tracking and the removal reminder."
 
