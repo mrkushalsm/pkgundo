@@ -134,9 +134,23 @@ pub enum Commands {
     #[command(hide = true)]
     PacmanHookInstall,
 
-    /// Install (or remove) the pacman hooks that auto-track newly installed
-    /// packages and remind you to review a tracked app's accumulated $HOME
-    /// mutations after `pacman -R` removes it. Requires root.
+    /// Snapshot the currently-installed package list before an apt/dpkg
+    /// transaction. Invoked by `DPkg::Pre-Invoke` via `pkgundo install-hook`.
+    /// Not intended for direct interactive use.
+    #[command(hide = true)]
+    AptHookPre,
+
+    /// Diff the post-transaction package list against the pre-transaction
+    /// snapshot and auto-track/remind accordingly. Invoked by
+    /// `DPkg::Post-Invoke` via `pkgundo install-hook`. Not intended for
+    /// direct interactive use.
+    #[command(hide = true)]
+    AptHookPost,
+
+    /// Install (or remove) the package-manager hooks (pacman and/or
+    /// apt/dpkg, whichever are detected on this system) that auto-track
+    /// newly installed packages and remind you to review a tracked app's
+    /// accumulated $HOME mutations after it's removed. Requires root.
     InstallHook {
         /// Remove the hook instead of installing it
         #[arg(long, default_value = "false")]

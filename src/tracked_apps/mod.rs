@@ -34,10 +34,14 @@ pub struct TrackedApp {
     pub untracked_at: Option<String>,
 }
 
-/// Directories pacman's file listings put real binaries under. `/usr/lib/`
-/// is included because many apps (Firefox included) ship their real binary
-/// there, with only a wrapper/symlink under `/usr/bin`.
-const BIN_DIRS: &[&str] = &["/usr/bin/", "/usr/sbin/", "/usr/local/bin/", "/bin/", "/sbin/", "/usr/lib/"];
+/// Directories pacman's and dpkg's file listings put real binaries under.
+/// `/usr/lib/` is included because many apps (Firefox included) ship their
+/// real binary there, with only a wrapper/symlink under `/usr/bin`.
+/// `/usr/games/` is Debian/Ubuntu's standard location for game-ish packages
+/// (cowsay, sl, cmatrix, fortune-mod, figlet, ...) — a real dpkg-only
+/// convention, not present on Arch.
+const BIN_DIRS: &[&str] =
+    &["/usr/bin/", "/usr/sbin/", "/usr/local/bin/", "/bin/", "/sbin/", "/usr/lib/", "/usr/games/"];
 
 fn is_executable_candidate(path: &str) -> bool {
     if path.ends_with('/') || !BIN_DIRS.iter().any(|d| path.starts_with(d)) {
@@ -60,15 +64,36 @@ pub fn executable_binaries_from_listing(listing: &str) -> Vec<String> {
         .collect()
 }
 
-/// Resolve `app` to either a pacman package's owned binaries, or a literal
-/// binary path/name. Tries package resolution first, falls back to treating
-/// `app` as a binary.
+/// Parse a `dpkg -L <pkg>` listing (one absolute path per line, no leading
+/// package-name token — unlike pacman's `-Ql`) into the executable subset.
+/// A new sibling to `executable_binaries_from_listing`, not a change to it:
+/// that function's two-column parsing is also relied on by `scan_leftovers`
+/// for pacman's own listing format and must keep working unchanged.
+pub fn executable_binaries_from_dpkg_listing(listing: &str) -> Vec<String> {
+    listing.lines().map(str::trim).filter(|p| is_executable_candidate(p)).map(String::from).collect()
+}
+
+/// Resolve `app` to either a package's owned binaries (pacman first, then
+/// dpkg), or a literal binary path/name. Falls back to treating `app` as a
+/// binary if neither package manager resolves it.
 pub fn resolve_app_targets(app: &str) -> Result<ResolvedTarget> {
     if Command::new("which").arg("pacman").output().map(|o| o.status.success()).unwrap_or(false) {
         if let Ok(output) = Command::new("pacman").args(["-Ql", app]).output() {
             if output.status.success() {
                 let listing = String::from_utf8_lossy(&output.stdout);
                 let binaries = executable_binaries_from_listing(&listing);
+                if !binaries.is_empty() {
+                    return Ok(ResolvedTarget::Package { package_name: app.to_string(), binaries });
+                }
+            }
+        }
+    }
+
+    if Command::new("which").arg("dpkg").output().map(|o| o.status.success()).unwrap_or(false) {
+        if let Ok(output) = Command::new("dpkg").args(["-L", app]).output() {
+            if output.status.success() {
+                let listing = String::from_utf8_lossy(&output.stdout);
+                let binaries = executable_binaries_from_dpkg_listing(&listing);
                 if !binaries.is_empty() {
                     return Ok(ResolvedTarget::Package { package_name: app.to_string(), binaries });
                 }
@@ -91,7 +116,7 @@ pub fn resolve_app_targets(app: &str) -> Result<ResolvedTarget> {
 
     if !Path::new(&path).exists() {
         bail!(
-            "'{}' is not a known pacman package and no binary was found at or named '{}'",
+            "'{}' is not a known pacman/dpkg package and no binary was found at or named '{}'",
             app, path
         );
     }
@@ -227,4 +252,35 @@ pub fn list_tracked_apps(conn: &Connection, include_all: bool) -> Result<Vec<Tra
         .collect::<rusqlite::Result<Vec<_>>>()
         .context("Failed to list tracked apps")?;
     Ok(apps)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dpkg_listing_keeps_only_executables_under_bin_dirs() {
+        // /usr/bin/env is virtually guaranteed present+executable on any
+        // Linux box (including this test sandbox); /etc/hostname is a real,
+        // existing, non-executable file outside BIN_DIRS — both are stable
+        // fixtures for asserting the filter without needing tempfiles under
+        // /usr/bin, which a test can't create.
+        let listing = "/usr/bin/env\n/etc/hostname\n/usr/share/doc/foo/README\n";
+        let binaries = executable_binaries_from_dpkg_listing(listing);
+        assert_eq!(binaries, vec!["/usr/bin/env".to_string()]);
+    }
+
+    #[test]
+    fn dpkg_listing_trims_whitespace_and_ignores_directory_entries() {
+        // dpkg -L lists owned directories too, one per line with a
+        // trailing slash — `is_executable_candidate` already rejects those.
+        let listing = "  /usr/bin/env  \n/usr/bin/\n";
+        let binaries = executable_binaries_from_dpkg_listing(listing);
+        assert_eq!(binaries, vec!["/usr/bin/env".to_string()]);
+    }
+
+    #[test]
+    fn dpkg_listing_of_empty_input_is_empty() {
+        assert!(executable_binaries_from_dpkg_listing("").is_empty());
+    }
 }

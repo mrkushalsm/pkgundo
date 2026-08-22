@@ -35,7 +35,10 @@ async fn main() -> Result<()> {
     // Print banner — except for the pacman hook, whose output lands inline
     // in someone's `pacman -R` terminal and has no business showing an
     // ASCII banner there.
-    if !matches!(cli.command, Commands::PacmanHook | Commands::PacmanHookInstall) {
+    if !matches!(
+        cli.command,
+        Commands::PacmanHook | Commands::PacmanHookInstall | Commands::AptHookPre | Commands::AptHookPost
+    ) {
         print_banner();
     }
 
@@ -91,6 +94,15 @@ async fn main() -> Result<()> {
             // every `pacman -S`, so it must never make an install look
             // like it failed.
             commands::hook::handle_pacman_hook_install(db_path).await;
+        }
+        Commands::AptHookPre => {
+            // Same always-exit-0 contract as PacmanHook — arguably more
+            // load-bearing here, since a failing DPkg::Pre-Invoke can
+            // abort apt's whole transaction (unlike pacman's Exec).
+            commands::apt_hook::handle_apt_hook_pre(db_path);
+        }
+        Commands::AptHookPost => {
+            commands::apt_hook::handle_apt_hook_post(db_path).await;
         }
         Commands::InstallHook { remove } => {
             commands::hook::handle_install_hook(*remove)?;

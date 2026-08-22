@@ -22,7 +22,11 @@ SNAPSHOT_NAME="clean"
 # parent directories, regardless of the disk file's own permissions).
 # /var/lib/libvirt/images is already set up for it to reach.
 WORKDIR="/var/lib/libvirt/images/${VM_NAME}"
-BASE_IMAGE="$WORKDIR/arch-base.qcow2"
+# BASE_IMAGE_FILENAME lets a sibling setup script (e.g. setup-vm-debian.sh)
+# override the base-image filename before sourcing this file — WORKDIR is
+# already isolated per VM_NAME, so this just keeps the filename itself from
+# being misleadingly "arch-*" for a non-Arch guest sharing this plumbing.
+BASE_IMAGE="$WORKDIR/${BASE_IMAGE_FILENAME:-arch-base.qcow2}"
 VM_DISK="$WORKDIR/${VM_NAME}.qcow2"
 SSH_KEY="$WORKDIR/id_ed25519"
 ARCH_CLOUD_IMAGE_URL="https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2"

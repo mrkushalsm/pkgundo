@@ -1,3 +1,4 @@
+pub mod apt_hook;
 pub mod hook;
 pub mod query;
 pub mod recover;

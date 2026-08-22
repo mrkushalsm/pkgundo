@@ -24,6 +24,32 @@ const HOOK_REMOVE_PATH: &str = "/etc/pacman.d/hooks/99-pkgundo-tracked.hook";
 const HOOK_REMOVE_TEMPLATE: &str = include_str!("../../hooks/99-pkgundo-tracked.hook");
 const HOOK_INSTALL_PATH: &str = "/etc/pacman.d/hooks/98-pkgundo-track-on-install.hook";
 const HOOK_INSTALL_TEMPLATE: &str = include_str!("../../hooks/98-pkgundo-track-on-install.hook");
+const APT_HOOK_PATH: &str = "/etc/apt/apt.conf.d/98pkgundo.conf";
+const APT_HOOK_TEMPLATE: &str = include_str!("../../hooks/98pkgundo.apt.conf");
+
+/// Package managers `install-hook` knows how to wire up. Detection checks
+/// for the binary pkgundo itself actually shells out to (`dpkg`, not
+/// `apt-get`/`apt-mark` — those are assumed co-installed on any
+/// dpkg-based system), not just "is this distro family present."
+enum DetectedPm {
+    Pacman,
+    Apt,
+}
+
+fn which_ok(bin: &str) -> bool {
+    Command::new("which").arg(bin).output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+fn detect_package_managers() -> Vec<DetectedPm> {
+    let mut out = Vec::new();
+    if which_ok("pacman") {
+        out.push(DetectedPm::Pacman);
+    }
+    if which_ok("dpkg") {
+        out.push(DetectedPm::Apt);
+    }
+    out
+}
 
 /// Entry point called from `main`. Every internal failure is caught and
 /// logged rather than propagated — this must never make `pacman -R` itself
@@ -52,22 +78,39 @@ fn run_pacman_hook(db_path: &str) -> Result<()> {
     }
 
     let conn = db::open_db_readonly(db_path)?;
+    let hits = find_tracked_removed(&conn, &package_names)?;
+    print_removal_reminders(&hits);
+    Ok(())
+}
 
+/// Given package names, look each up as a currently-tracked app. PM-agnostic:
+/// pacman and apt differ only in how `package_names` was obtained (pacman's
+/// `NeedsTargets` stdin vs. apt's snapshot-diff), not in this lookup itself.
+pub(crate) fn find_tracked_removed(
+    conn: &rusqlite::Connection,
+    package_names: &[&str],
+) -> Result<Vec<(String, String, usize)>> {
     let mut hits: Vec<(String, String, usize)> = Vec::new(); // (package, tracked name, mutation count)
     for pkg in package_names {
-        if let Some(app) = tracked_apps::load_tracked_app_by_package(&conn, pkg)? {
-            let count = journal::get_mutations(&conn, app.txid)?.len();
+        if let Some(app) = tracked_apps::load_tracked_app_by_package(conn, pkg)? {
+            let count = journal::get_mutations(conn, app.txid)?.len();
             hits.push((pkg.to_string(), app.name.clone(), count));
         }
     }
+    Ok(hits)
+}
 
+/// Print the single-match / bulk-match reminder block for `hits`. No-op if
+/// empty. PM-agnostic — shared verbatim by pacman and apt so the reminder
+/// text/shape stays identical regardless of which PM's hook triggered it.
+pub(crate) fn print_removal_reminders(hits: &[(String, String, usize)]) {
     if hits.is_empty() {
-        return Ok(());
+        return;
     }
 
     // One summary block covering every match in this transaction, not one
-    // reminder per package — a bulk `pacman -Rs` removing several tracked
-    // apps at once shouldn't wall-of-text the user's terminal.
+    // reminder per package — a bulk removal of several tracked apps at once
+    // shouldn't wall-of-text the user's terminal.
     println!();
     if hits.len() == 1 {
         let (pkg, name, count) = &hits[0];
@@ -84,7 +127,7 @@ fn run_pacman_hook(db_path: &str) -> Result<()> {
         );
     } else {
         println!("{} {} tracked apps were just removed:", "→".yellow(), hits.len());
-        for (pkg, name, count) in &hits {
+        for (pkg, name, count) in hits {
             println!("    {} ({} mutation(s) recorded under $HOME)", pkg, count);
             let _ = name;
         }
@@ -92,8 +135,6 @@ fn run_pacman_hook(db_path: &str) -> Result<()> {
         println!("  Preview first:              {}", "pkgundo untrack <name> --rollback --dry-run".cyan());
     }
     println!();
-
-    Ok(())
 }
 
 /// `pkgundo install-hook` / `pkgundo install-hook --remove`.
@@ -107,7 +148,10 @@ pub fn handle_install_hook(remove: bool) -> Result<()> {
     }
 
     if remove {
-        for path in [HOOK_INSTALL_PATH, HOOK_REMOVE_PATH] {
+        // Unconditional, regardless of what's currently detected — a hook
+        // installed while a PM was present should still get cleaned up
+        // even if that PM is later removed (e.g. testing/migration).
+        for path in [HOOK_INSTALL_PATH, HOOK_REMOVE_PATH, APT_HOOK_PATH] {
             if Path::new(path).exists() {
                 std::fs::remove_file(path).with_context(|| format!("Failed to remove {}", path))?;
                 println!("{} Removed {}", "✓".green(), path);
@@ -118,25 +162,42 @@ pub fn handle_install_hook(remove: bool) -> Result<()> {
         return Ok(());
     }
 
+    let detected = detect_package_managers();
+    if detected.is_empty() {
+        bail!("pkgundo install-hook: no supported package manager (pacman, apt/dpkg) detected on this system.");
+    }
+
     let exe = std::env::current_exe().context("Failed to resolve pkgundo's own executable path")?;
     let exe_str = exe.to_string_lossy();
 
-    for (path, template) in [
-        (HOOK_INSTALL_PATH, HOOK_INSTALL_TEMPLATE),
-        (HOOK_REMOVE_PATH, HOOK_REMOVE_TEMPLATE),
-    ] {
-        let contents = template.replace("/usr/bin/pkgundo", &exe_str);
-        if let Some(parent) = Path::new(path).parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create hook directory {}", parent.display()))?;
+    for pm in &detected {
+        let files: &[(&str, &str)] = match pm {
+            DetectedPm::Pacman => &[(HOOK_INSTALL_PATH, HOOK_INSTALL_TEMPLATE), (HOOK_REMOVE_PATH, HOOK_REMOVE_TEMPLATE)],
+            DetectedPm::Apt => &[(APT_HOOK_PATH, APT_HOOK_TEMPLATE)],
+        };
+        for (path, template) in files {
+            let contents = template.replace("/usr/bin/pkgundo", &exe_str);
+            if let Some(parent) = Path::new(path).parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("Failed to create hook directory {}", parent.display()))?;
+            }
+            std::fs::write(path, contents).with_context(|| format!("Failed to write {}", path))?;
+            println!("{} Installed hook at {} (Exec = {})", "✓".green(), path, exe_str);
         }
-        std::fs::write(path, contents).with_context(|| format!("Failed to write {}", path))?;
-        println!("{} Installed pacman hook at {} (Exec = {})", "✓".green(), path, exe_str);
     }
+
+    if detected.len() > 1 {
+        println!("{} Both pacman and apt/dpkg hooks were installed.", "→".yellow());
+    }
+    let (install_cmd, remove_cmd): (&str, &str) = match &detected[0] {
+        DetectedPm::Pacman if detected.len() == 1 => ("pacman -S", "pacman -R"),
+        DetectedPm::Apt if detected.len() == 1 => ("apt install", "apt remove"),
+        _ => ("an install", "a removal"),
+    };
     println!(
         "  From now on, {} will auto-track newly, explicitly installed packages, and\n  {} will print a reminder after removing one that's tracked.",
-        "pacman -S".yellow(),
-        "pacman -R".yellow()
+        install_cmd.yellow(),
+        remove_cmd.yellow()
     );
 
     Ok(())
@@ -175,11 +236,25 @@ async fn run_pacman_install_hook(db_path: &str) -> Result<()> {
     // asked to have watched.
     let already_tracked = db::open_db_readonly(db_path).ok();
 
+    auto_track_new_installs(&package_names, already_tracked.as_ref(), is_explicitly_installed).await
+}
+
+/// Given newly-installed package names, an explicit-install predicate, and
+/// (optionally) a readonly DB connection to skip already-tracked packages,
+/// send `Track` requests to the daemon for each that's explicit and not yet
+/// tracked. PM-agnostic: pacman and apt differ only in `is_explicit` (a
+/// per-package `pacman -Qi` check vs. a precomputed `apt-mark showmanual`
+/// set) and in how `package_names` was obtained.
+pub(crate) async fn auto_track_new_installs(
+    package_names: &[&str],
+    already_tracked: Option<&rusqlite::Connection>,
+    is_explicit: impl Fn(&str) -> bool,
+) -> Result<()> {
     for pkg in package_names {
-        if !is_explicitly_installed(pkg) {
+        if !is_explicit(pkg) {
             continue;
         }
-        if let Some(conn) = &already_tracked {
+        if let Some(conn) = already_tracked {
             if tracked_apps::load_tracked_app_by_package(conn, pkg)?.is_some() {
                 continue;
             }
@@ -190,12 +265,12 @@ async fn run_pacman_install_hook(db_path: &str) -> Result<()> {
                 println!("{} pkgundo is now auto-tracking newly installed '{}'.", "→".yellow(), pkg);
             }
             Ok(Response::Error { message }) => {
-                log::warn!("pkgundo pacman-hook-install: track '{}' failed: {}", pkg, message);
+                log::warn!("pkgundo hook: track '{}' failed: {}", pkg, message);
             }
             Ok(other) => {
-                log::warn!("pkgundo pacman-hook-install: unexpected response tracking '{}': {:?}", pkg, other);
+                log::warn!("pkgundo hook: unexpected response tracking '{}': {:?}", pkg, other);
             }
-            Err(e) => log::warn!("pkgundo pacman-hook-install: {}", e),
+            Err(e) => log::warn!("pkgundo hook: {}", e),
         }
     }
 
