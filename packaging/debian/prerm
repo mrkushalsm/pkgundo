@@ -1,0 +1,11 @@
+#!/bin/sh
+# Runs before the .deb's files are removed. Only tear down the daemon/hooks
+# on a genuine removal ($1 = remove/purge), not on an upgrade ($1 = upgrade)
+# where the new version's postinst will re-run `pkgundo setup` anyway.
+set -e
+
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+    /usr/bin/pkgundo setup --remove || true
+fi
+
+exit 0

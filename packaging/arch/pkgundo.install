@@ -1,0 +1,15 @@
+# pacman install-scriptlet: `pkgundo setup` is idempotent (installs/
+# enables the daemon unit and package-manager hooks, safe to re-run), so
+# it's called unconditionally on both install and upgrade.
+
+post_install() {
+    pkgundo setup || true
+}
+
+post_upgrade() {
+    pkgundo setup || true
+}
+
+pre_remove() {
+    pkgundo setup --remove || true
+}

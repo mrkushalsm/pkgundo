@@ -5,6 +5,8 @@ edition = "2021"
 description = "Universal Linux transaction monitor, mutation provenance engine, and intelligent rollback system"
 authors = ["pkgundo contributors"]
 license = "MIT"
+homepage = "https://github.com/mrkushalsm/pkgundo"
+repository = "https://github.com/mrkushalsm/pkgundo"
 
 [[bin]]
 name = "pkgundo"
@@ -69,3 +71,31 @@ libc = "0.2"
 opt-level = 3
 lto = true
 strip = true
+
+[package.metadata.deb]
+maintainer = "pkgundo contributors"
+copyright = "2026, pkgundo contributors"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+pkgundo watches what a package or command actually does to your $HOME \
+across its whole life, then lets you review and reverse it — archived, \
+never blindly deleted. Includes native auto-track/removal-reminder hooks \
+for pacman, apt/dpkg, and dnf5."""
+section = "admin"
+priority = "optional"
+depends = "$auto"
+assets = [
+    ["target/release/pkgundo", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/pkgundo/README.md", "644"],
+    ["LICENSE", "usr/share/doc/pkgundo/LICENSE", "644"],
+]
+maintainer-scripts = "packaging/debian"
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/pkgundo", dest = "/usr/bin/pkgundo", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/pkgundo/README.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/doc/pkgundo/LICENSE", mode = "644", doc = true },
+]
+post_install_script = "packaging/rpm/post_install.sh"
+pre_uninstall_script = "packaging/rpm/pre_uninstall.sh"

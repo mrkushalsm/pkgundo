@@ -1,0 +1,47 @@
+# Maintainer: pkgundo contributors
+pkgname=pkgundo
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Universal Linux transaction monitor, mutation provenance engine, and intelligent rollback system"
+arch=('x86_64')
+url="https://github.com/mrkushalsm/pkgundo"
+license=('MIT')
+depends=('gcc-libs' 'systemd')
+makedepends=('cargo')
+backup=()
+install="$pkgname.install"
+source=("$pkgname-$pkgver.tar.gz::https://github.com/mrkushalsm/pkgundo/archive/refs/tags/v$pkgver.tar.gz")
+# Regenerate with `updpkgsums` once a real v$pkgver tag/release exists.
+sha256sums=('SKIP')
+
+build() {
+    cd "$pkgname-$pkgver"
+    # makepkg's default `lto` build option appends -flto=auto to
+    # CFLAGS/CXXFLAGS/LDFLAGS. rusqlite's "bundled" feature compiles its
+    # own sqlite3.c via the `cc` crate using those same CFLAGS, so with
+    # GCC-level LTO applied there *and* Rust's own LTO already enabled
+    # (Cargo.toml's [profile.release] lto = true), the two LTO pipelines
+    # conflict and the linker drops sqlite3's symbols entirely
+    # ("undefined symbol: sqlite3_*"). This is a documented Arch
+    # Rust-packaging gotcha — strip -flto from the C-facing flags only;
+    # Rust's own LTO (controlled via Cargo.toml) is unaffected.
+    export CFLAGS="${CFLAGS//-flto=auto/}"
+    export CXXFLAGS="${CXXFLAGS//-flto=auto/}"
+    export LDFLAGS="${LDFLAGS//-flto=auto/}"
+    cargo build --release --locked
+}
+
+check() {
+    cd "$pkgname-$pkgver"
+    export CFLAGS="${CFLAGS//-flto=auto/}"
+    export CXXFLAGS="${CXXFLAGS//-flto=auto/}"
+    export LDFLAGS="${LDFLAGS//-flto=auto/}"
+    cargo test --release --locked
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+    install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

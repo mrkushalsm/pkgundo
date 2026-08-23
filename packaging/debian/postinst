@@ -1,0 +1,12 @@
+#!/bin/sh
+# Runs after the .deb's files are unpacked, on both fresh installs and
+# upgrades. `pkgundo setup` is idempotent (installs/enables the daemon
+# unit and package-manager hooks, safe to re-run), so it's called
+# unconditionally on `configure` rather than only on a fresh install.
+set -e
+
+if [ "$1" = "configure" ]; then
+    /usr/bin/pkgundo setup || true
+fi
+
+exit 0
