@@ -228,6 +228,60 @@ ssh_vm "$IP" "systemctl is-active pkgundo-daemon" | grep -q active || fail "daem
 echo "PASS: daemon health unaffected throughout — hooks and install-hook are both CLI-side, no daemon involvement."
 
 echo
+echo "== [12] Real-world dev workflow: track npm, use it like an actual developer would, confirm mutations land on npm's own txid =="
+# Re-enable the hooks (removed in step 10).
+ssh_vm "$IP" "sudo $BIN install-hook"
+ssh_vm "$IP" "sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs npm >/dev/null"
+sleep 1
+ssh_vm "$IP" "$BIN tracked" | grep -q "^npm" || fail "npm should have been auto-tracked on explicit install"
+ssh_vm "$IP" "$BIN tracked" | grep -q "^nodejs" || fail "nodejs should have been auto-tracked on explicit install"
+NPM_TXID="$(ssh_vm "$IP" "$BIN tracked" | grep "^npm" | grep -oP 'txid=\K[0-9]+')"
+# A real no-sudo dev setup (npm config set prefix), a real -g install, and a
+# real per-project local install — exactly how a developer actually uses npm,
+# not a synthetic single-file write.
+ssh_vm "$IP" "mkdir -p ~/.npm-global ~/myproj && npm config set prefix ~/.npm-global && npm install -g cowsay >/dev/null 2>&1 && cd ~/myproj && npm init -y >/dev/null 2>&1 && npm install lodash >/dev/null 2>&1; echo DONE"
+sleep 2
+NPM_MUTATIONS="$(ssh_vm "$IP" "$BIN inspect $NPM_TXID" | grep -oP 'Total mutations:\s*\K[0-9]+')"
+[ "$NPM_MUTATIONS" -gt 0 ] || fail "expected npm's own txid ($NPM_TXID) to have real mutations recorded, got $NPM_MUTATIONS"
+echo "PASS: npm install (-g and local-project) correctly attributed $NPM_MUTATIONS mutation(s) to npm's own txid=$NPM_TXID."
+# Regression check for a real bug found this session, on this exact distro:
+# Debian's /usr/bin/npm is a symlink to /usr/share/nodejs/npm/bin/npm-cli.js
+# — a path outside tracked_apps::BIN_DIRS, so npm's own resolved-paths list
+# never includes it, and every npm launch execs through node. Without the
+# fix (keying ExecWatch's match table by each tracked path's canonicalized
+# form, and making the first exec-match for a pid own that pid), every one
+# of npm's writes above was silently and consistently landing on nodejs's
+# txid instead — this is the exact distro where that was first caught live.
+NPMNODE_REMOVE_OUT="$(ssh_vm "$IP" "sudo env DEBIAN_FRONTEND=noninteractive apt-get remove -y nodejs npm 2>&1")"
+# Removing both in one transaction is apt's *bulk* case (step 6 above
+# already covers this shape): one combined "N tracked apps were just
+# removed:" block listing each by name, not apt's own single-match
+# "pkgundo was tracking removed package '<pkg>'" line.
+echo "$NPMNODE_REMOVE_OUT" | grep -q "tracked apps were just removed" || fail "expected the combined bulk-removal summary for nodejs+npm"
+echo "$NPMNODE_REMOVE_OUT" | grep -q "^    npm " || fail "expected npm named in its own line of the combined bulk-removal summary"
+echo "$NPMNODE_REMOVE_OUT" | grep -q "^    nodejs " || fail "expected nodejs named in its own line of the combined bulk-removal summary"
+echo "PASS: nodejs+npm bulk removal correctly named both packages, npm specifically included (not silently absorbed into nodejs)."
+
+echo
+echo "== [13] Real-world heavy package: firefox-esr install/launch/remove =="
+ssh_vm "$IP" "sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y firefox-esr xvfb >/dev/null"
+sleep 1
+ssh_vm "$IP" "$BIN tracked" | grep -q "^firefox-esr" || fail "firefox-esr should have been auto-tracked on explicit install"
+FIREFOX_TXID="$(ssh_vm "$IP" "$BIN tracked" | grep "^firefox-esr" | grep -oP 'txid=\K[0-9]+')"
+# Launch it for real (headless, via xvfb — no GPU in this VM) to generate a
+# genuine ~/.mozilla profile, the same way a first-run desktop launch would.
+ssh_vm "$IP" "xvfb-run -a firefox --headless https://example.com >/dev/null 2>&1 & sleep 8; pkill firefox 2>/dev/null; sleep 1; true"
+FIREFOX_MUTATIONS="$(ssh_vm "$IP" "$BIN inspect $FIREFOX_TXID" | grep -oP 'Total mutations:\s*\K[0-9]+')"
+[ "$FIREFOX_MUTATIONS" -gt 0 ] || fail "expected a real firefox launch to produce at least one mutation under \$HOME"
+echo "PASS: a real firefox launch produced $FIREFOX_MUTATIONS real mutation(s), correctly attributed."
+FIREFOX_REMOVE_OUT="$(ssh_vm "$IP" "sudo env DEBIAN_FRONTEND=noninteractive apt-get remove -y firefox-esr 2>&1")"
+echo "$FIREFOX_REMOVE_OUT" | grep -q "pkgundo was tracking removed package 'firefox-esr'" || fail "expected a removal reminder naming firefox-esr"
+echo "PASS: removing a real heavy package (firefox-esr) with an actual profile produced the correct reminder."
+
+ssh_vm "$IP" "systemctl is-active pkgundo-daemon" | grep -q active || fail "daemon health was affected by real-world npm/firefox testing — it never should be"
+echo "PASS: daemon health unaffected by real-world npm/firefox testing."
+
+echo
 echo "== Reverting VM back to clean snapshot (leaving it ready for next run) =="
 virsh snapshot-revert "$VM_NAME" "$SNAPSHOT_NAME" --running >/dev/null
 

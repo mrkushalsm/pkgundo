@@ -90,11 +90,28 @@ impl ExecWatch {
 
     /// Arm `FAN_OPEN_EXEC` marks for every one of `paths` and record which
     /// app/txid they belong to. Called after `Track`'s DB write succeeds.
+    ///
+    /// Keys `watched` by each path's *canonicalized* form, not the literal
+    /// tracked path. A tracked path is often a symlink (e.g. Debian's
+    /// `/usr/bin/npm` -> `/usr/share/nodejs/npm/bin/npm-cli.js`) — marking
+    /// still resolves it to the right inode either way, but the match side
+    /// (`run`'s event loop) can only ever learn the *resolved* path, via
+    /// `readlink("/proc/self/fd/N")` on the fd the kernel handed back for
+    /// the file it actually opened. A key of the literal symlink path can
+    /// therefore never match, silently dropping every launch of that app.
+    /// Discovered live: on Debian, `/usr/share/nodejs/...` falls outside
+    /// `tracked_apps::BIN_DIRS`, so npm's own real script never got listed
+    /// as one of its resolved paths in the first place — only its `/usr/bin`
+    /// symlinks did — and every npm launch's writes were silently
+    /// misattributed to nodejs (the one real, non-symlink path in the
+    /// chain) instead, with `pkgundo inspect`/`untrack --rollback` on npm
+    /// always reporting zero mutations no matter how much npm actually did.
     pub fn watch_app(&self, name: &str, txid: i64, paths: &[String]) -> Result<()> {
         let mut watched = self.watched.lock().unwrap_or_else(|p| p.into_inner());
         for path in paths {
             self.mark(path, true)?;
-            watched.insert(PathBuf::from(path), WatchedApp { name: name.to_string(), txid });
+            let key = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+            watched.insert(key, WatchedApp { name: name.to_string(), txid });
         }
         Ok(())
     }
@@ -208,10 +225,6 @@ impl ExecWatch {
                     watched.get(&exec_path).map(|w| (w.name.clone(), w.txid))
                 };
                 if let Some((name, txid)) = matched {
-                    log::info!(
-                        "exec-watch: detected launch of tracked app '{}' (pid={}, path={})",
-                        name, pid, exec_path.display()
-                    );
                     // Resolved synchronously, right here, rather than inside
                     // the spawned task below: a process that forks and lets
                     // its parent exit immediately (a common daemonize
@@ -229,11 +242,60 @@ impl ExecWatch {
                             continue;
                         }
                     };
+                    let home = match crate::scan_leftovers::home_dir_for_uid(uid).filter(|h| is_usable_home(h)) {
+                        Some(h) => h,
+                        None => {
+                            log::warn!(
+                                "exec-watch: uid {} has no usable home dir (got '/' or none), skipping launch",
+                                uid
+                            );
+                            continue;
+                        }
+                    };
+                    // A single logical launch can fire more than one match
+                    // for the *same* pid: a shebang script (e.g. `npm`, via
+                    // `#!/usr/bin/env node`) triggers FAN_OPEN_EXEC once for
+                    // the script itself and again for the interpreter binfmt
+                    // hands off to — and if that interpreter is *also* a
+                    // separately tracked app (e.g. `nodejs`), both matches
+                    // land here for the same pid. The claim below (check +
+                    // insert under one lock, entirely synchronous) makes the
+                    // first match to reach this point own the pid outright;
+                    // a later match for the same pid — however soon after —
+                    // finds the entry already present and backs off, rather
+                    // than racing a second `tokio::spawn`'d task to insert
+                    // over it. Discovered live: dogfooding a real `npm
+                    // install` misattributed 4500+ real mutations to
+                    // nodejs's txid instead of npm's, with a rerun of the
+                    // same command sometimes attributing correctly instead
+                    // — proof this was a scheduling race between two
+                    // spawned tasks, not a distro difference, since doing
+                    // the claim asynchronously (the previous approach) left
+                    // exactly this window open.
+                    {
+                        let mut guard = active_launches.lock().unwrap_or_else(|p| p.into_inner());
+                        if guard.contains_key(&pid) {
+                            log::debug!(
+                                "exec-watch: pid {} already owns an active launch, ignoring later match '{}' ({})",
+                                pid, name, exec_path.display()
+                            );
+                            continue;
+                        }
+                        let root_launch = match ActiveLaunch::new(txid, home.clone()) {
+                            Some(l) => l,
+                            None => continue, // ActiveLaunch::new already logs the reason
+                        };
+                        guard.insert(pid, root_launch);
+                    }
+                    log::info!(
+                        "exec-watch: detected launch of tracked app '{}' (pid={}, path={})",
+                        name, pid, exec_path.display()
+                    );
                     let db_path = db_path.clone();
                     let active_launches = Arc::clone(&active_launches);
                     let mutation_capture = Arc::clone(&mutation_capture);
                     tokio::spawn(async move {
-                        spawn_launch(pid, uid, txid, db_path, active_launches, mutation_capture).await;
+                        spawn_launch(pid, txid, home, db_path, active_launches, mutation_capture).await;
                     });
                 }
             }
@@ -269,30 +331,20 @@ fn read_real_uid(pid: i32) -> Option<u32> {
     None
 }
 
+/// `home` and the pid's own `active_launches` entry are already resolved
+/// and claimed synchronously by the caller (`run`'s event loop) before this
+/// is spawned — see the claim comment there for why that has to happen
+/// before the `tokio::spawn` scheduling hop, not inside it.
 async fn spawn_launch(
     pid: i32,
-    uid: u32,
     txid: i64,
+    home: PathBuf,
     db_path: String,
     active_launches: Arc<Mutex<HashMap<i32, ActiveLaunch>>>,
     mutation_capture: Arc<MutationCapture>,
 ) {
-    let home = match crate::scan_leftovers::home_dir_for_uid(uid).filter(|h| is_usable_home(h)) {
-        Some(h) => h,
-        None => {
-            log::warn!("exec-watch: uid {} has no usable home dir (got '/' or none), skipping launch", uid);
-            return;
-        }
-    };
-
-    let root_launch = match ActiveLaunch::new(txid, home.clone()) {
-        Some(l) => l,
-        None => return, // ActiveLaunch::new already logs the reason
-    };
-
     let launch_pids = Arc::new(Mutex::new(HashSet::new()));
     launch_pids.lock().unwrap_or_else(|p| p.into_inner()).insert(pid);
-    active_launches.lock().unwrap_or_else(|p| p.into_inner()).insert(pid, root_launch);
 
     if let Err(e) = mutation_capture.start(&home) {
         log::warn!("exec-watch: MutationCapture::start failed for {}: {}", home.display(), e);

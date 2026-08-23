@@ -192,6 +192,49 @@ ssh_vm "$IP" "systemctl is-active pkgundo-daemon" | grep -q active || fail "daem
 echo "PASS: daemon health unaffected throughout — hooks and install-hook are both CLI-side, no daemon involvement."
 
 echo
+echo "== [12] Real-world dev workflow: nodejs install correctly pulls npm as nodejs-npm (a dependency, left untracked) =="
+# Mutation *capture* (exec-watch/fanotify) is a known, separate limitation
+# on this VM: Fedora Cloud's default root filesystem is btrfs, and this
+# kernel's fanotify_mark(FAN_MARK_FILESYSTEM | FAN_REPORT_FID) fails EXDEV
+# on every btrfs path (isolated live via a standalone C repro — verified
+# against a loopback ext4 filesystem on this same VM/kernel, which worked
+# fine — so it's genuinely btrfs-specific, not this VM/kernel in general).
+# See the plan's "known limitations" section. This means real npm/firefox
+# writes are never actually captured here, unlike the ext4-rooted Arch/
+# Debian VMs — so this section only exercises the hook/auto-track/reminder
+# mechanism itself (which doesn't depend on capture at all), not mutation
+# counts.
+#
+# Unlike Arch/Debian, Fedora has no standalone "npm" package at all —
+# `dnf install nodejs` alone pulls in npm bundled as nodejs-npm, purely as
+# an automatic dependency (confirmed live: `dnf install nodejs npm`
+# errors on "npm" as an unresolvable argument, since no such package name
+# exists here). So the correct real-world behavior to check on this distro
+# is the opposite of Arch/Debian's: nodejs-npm must NOT be auto-tracked.
+# Re-enable the hook (removed in step 10).
+ssh_vm "$IP" "sudo $BIN install-hook"
+ssh_vm "$IP" "sudo dnf install -y nodejs >/dev/null 2>&1; echo DONE"
+sleep 1
+ssh_vm "$IP" "$BIN tracked" | grep -q "^nodejs " || fail "nodejs should have been auto-tracked on explicit install"
+ssh_vm "$IP" "$BIN tracked" | grep -q "^nodejs-npm" && fail "nodejs-npm is a dependency-reason install here and should NOT have been auto-tracked"
+echo "PASS: nodejs auto-tracked; its bundled nodejs-npm dependency correctly left untracked (no standalone npm package exists on Fedora)."
+NODEJS_REMOVE_OUT="$(ssh_vm "$IP" "sudo dnf remove -y nodejs 2>&1")"
+echo "$NODEJS_REMOVE_OUT" | grep -q "pkgundo was tracking removed package 'nodejs'" || fail "expected a removal reminder naming nodejs"
+echo "PASS: removing nodejs produced the correct removal reminder."
+
+echo
+echo "== [13] Real-world heavy package: firefox install/remove =="
+ssh_vm "$IP" "sudo dnf install -y firefox >/dev/null 2>&1; echo DONE"
+sleep 1
+ssh_vm "$IP" "$BIN tracked" | grep -q "^firefox" || fail "firefox should have been auto-tracked on explicit install"
+FIREFOX_REMOVE_OUT="$(ssh_vm "$IP" "sudo dnf remove -y firefox 2>&1")"
+echo "$FIREFOX_REMOVE_OUT" | grep -q "pkgundo was tracking removed package 'firefox'" || fail "expected a removal reminder naming firefox"
+echo "PASS: a real heavy package (firefox) with a large dependency tree auto-tracked and produced the correct removal reminder."
+
+ssh_vm "$IP" "systemctl is-active pkgundo-daemon" | grep -q active || fail "daemon health was affected by real-world npm/firefox testing — it never should be"
+echo "PASS: daemon health unaffected by real-world npm/firefox testing."
+
+echo
 echo "== Reverting VM back to clean snapshot (leaving it ready for next run) =="
 virsh snapshot-revert "$VM_NAME" "$SNAPSHOT_NAME" --running >/dev/null
 
