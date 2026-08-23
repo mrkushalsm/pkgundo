@@ -101,6 +101,21 @@ pub fn resolve_app_targets(app: &str) -> Result<ResolvedTarget> {
         }
     }
 
+    if Command::new("which").arg("rpm").output().map(|o| o.status.success()).unwrap_or(false) {
+        if let Ok(output) = Command::new("rpm").args(["-ql", app]).output() {
+            if output.status.success() {
+                let listing = String::from_utf8_lossy(&output.stdout);
+                // rpm -ql's output shape (one absolute path per line, no
+                // leading package-name token) is identical to dpkg -L's, so
+                // the same listing parser applies unchanged.
+                let binaries = executable_binaries_from_dpkg_listing(&listing);
+                if !binaries.is_empty() {
+                    return Ok(ResolvedTarget::Package { package_name: app.to_string(), binaries });
+                }
+            }
+        }
+    }
+
     // Fall back: literal path, or a PATH-resolved binary name.
     let path = if app.starts_with('/') {
         app.to_string()
@@ -116,7 +131,7 @@ pub fn resolve_app_targets(app: &str) -> Result<ResolvedTarget> {
 
     if !Path::new(&path).exists() {
         bail!(
-            "'{}' is not a known pacman/dpkg package and no binary was found at or named '{}'",
+            "'{}' is not a known pacman/dpkg/rpm package and no binary was found at or named '{}'",
             app, path
         );
     }

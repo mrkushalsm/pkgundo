@@ -1,4 +1,5 @@
 pub mod apt_hook;
+pub mod dnf_hook;
 pub mod hook;
 pub mod query;
 pub mod recover;

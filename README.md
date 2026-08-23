@@ -20,10 +20,10 @@ Running `pkgundo track` manually every time is easy to forget. `pkgundo install-
 sudo pkgundo install-hook
 ```
 
-This detects which package manager(s) are present (pacman, and/or apt/dpkg) and installs the matching hook(s):
+This detects which package manager(s) are present (pacman, apt/dpkg, and/or dnf5) and installs the matching hook(s):
 
-- **On explicit install** (`pacman -S <pkg>` / `apt install <pkg>`): pkgundo starts tracking the package automatically — packages pulled in only as a dependency are left alone.
-- **On removal** (`pacman -R <pkg>` / `apt remove <pkg>`): if the removed package was being tracked, pkgundo prints a reminder in the same terminal, naming the review commands to run:
+- **On explicit install** (`pacman -S <pkg>` / `apt install <pkg>` / `dnf install <pkg>`): pkgundo starts tracking the package automatically — packages pulled in only as a dependency are left alone.
+- **On removal** (`pacman -R <pkg>` / `apt remove <pkg>` / `dnf remove <pkg>`): if the removed package was being tracked, pkgundo prints a reminder in the same terminal, naming the review commands to run:
   ```
   → pkgundo was tracking removed package 'weechat' (23 mutation(s) recorded under $HOME).
     Review and roll back: pkgundo untrack weechat --rollback
@@ -32,7 +32,7 @@ This detects which package manager(s) are present (pacman, and/or apt/dpkg) and 
 
 The hook only ever detects and reminds — it never touches your files on its own. Run `sudo pkgundo install-hook --remove` to undo it.
 
-Supported today: **pacman** (Arch/derivatives) and **apt/dpkg** (Debian/Ubuntu/derivatives). dnf/rpm support is planned as a follow-up.
+Supported today: **pacman** (Arch/derivatives), **apt/dpkg** (Debian/Ubuntu/derivatives), and **dnf5** (Fedora 41+). dnf5's hook mechanism needs a separate, optional plugin package that isn't installed by default — if `install-hook` is run on a dnf5 system without it, it'll tell you to run `sudo dnf install libdnf5-plugin-actions` first. Note that dnf5 hands pkgundo one package name per transaction event rather than a batched list, so removing several tracked packages in one `dnf remove` prints one reminder block per package instead of a single combined summary (unlike pacman/apt). dnf4/RHEL/CentOS (an older, incompatible dnf generation) isn't supported yet.
 
 ### Reviewing what gets removed
 

@@ -26,14 +26,20 @@ const HOOK_INSTALL_PATH: &str = "/etc/pacman.d/hooks/98-pkgundo-track-on-install
 const HOOK_INSTALL_TEMPLATE: &str = include_str!("../../hooks/98-pkgundo-track-on-install.hook");
 const APT_HOOK_PATH: &str = "/etc/apt/apt.conf.d/98pkgundo.conf";
 const APT_HOOK_TEMPLATE: &str = include_str!("../../hooks/98pkgundo.apt.conf");
+const DNF_HOOK_PATH: &str = "/etc/dnf/libdnf5-plugins/actions.d/98pkgundo.actions";
+const DNF_HOOK_TEMPLATE: &str = include_str!("../../hooks/98pkgundo.actions");
 
 /// Package managers `install-hook` knows how to wire up. Detection checks
 /// for the binary pkgundo itself actually shells out to (`dpkg`, not
 /// `apt-get`/`apt-mark` — those are assumed co-installed on any
-/// dpkg-based system), not just "is this distro family present."
+/// dpkg-based system), not just "is this distro family present." `dnf5`
+/// specifically (not `dnf`, which is just a symlink to it on Fedora 41+,
+/// but doesn't exist at all on dnf4/RHEL systems) — this is deliberately
+/// dnf5-only, dnf4/RHEL is a separate, unstarted future phase.
 enum DetectedPm {
     Pacman,
     Apt,
+    Dnf5,
 }
 
 fn which_ok(bin: &str) -> bool {
@@ -48,7 +54,22 @@ fn detect_package_managers() -> Vec<DetectedPm> {
     if which_ok("dpkg") {
         out.push(DetectedPm::Apt);
     }
+    if which_ok("dnf5") {
+        out.push(DetectedPm::Dnf5);
+    }
     out
+}
+
+/// dnf5's actions plugin is a separate, optional subpackage — unlike
+/// `dpkg`/`pacman`, which *are* the package manager and are always present
+/// once detected. Checked via `rpm -q` (rpm is always present alongside
+/// dnf5) rather than assumed installed.
+fn dnf5_actions_plugin_installed() -> bool {
+    Command::new("rpm")
+        .args(["-q", "libdnf5-plugin-actions"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Entry point called from `main`. Every internal failure is caught and
@@ -151,7 +172,7 @@ pub fn handle_install_hook(remove: bool) -> Result<()> {
         // Unconditional, regardless of what's currently detected — a hook
         // installed while a PM was present should still get cleaned up
         // even if that PM is later removed (e.g. testing/migration).
-        for path in [HOOK_INSTALL_PATH, HOOK_REMOVE_PATH, APT_HOOK_PATH] {
+        for path in [HOOK_INSTALL_PATH, HOOK_REMOVE_PATH, APT_HOOK_PATH, DNF_HOOK_PATH] {
             if Path::new(path).exists() {
                 std::fs::remove_file(path).with_context(|| format!("Failed to remove {}", path))?;
                 println!("{} Removed {}", "✓".green(), path);
@@ -164,7 +185,19 @@ pub fn handle_install_hook(remove: bool) -> Result<()> {
 
     let detected = detect_package_managers();
     if detected.is_empty() {
-        bail!("pkgundo install-hook: no supported package manager (pacman, apt/dpkg) detected on this system.");
+        bail!("pkgundo install-hook: no supported package manager (pacman, apt/dpkg, dnf5) detected on this system.");
+    }
+
+    // Pre-flight: validate every detected PM's prerequisites *before*
+    // writing anything. Doing this check inline inside the write loop
+    // below would let an earlier PM's hook files land on disk before a
+    // later PM's check fails and bails via `?` — a silent partial-write.
+    for pm in &detected {
+        if matches!(pm, DetectedPm::Dnf5) && !dnf5_actions_plugin_installed() {
+            bail!(
+                "pkgundo install-hook: dnf5's 'actions' plugin is required but not installed — install it first: sudo dnf install libdnf5-plugin-actions"
+            );
+        }
     }
 
     let exe = std::env::current_exe().context("Failed to resolve pkgundo's own executable path")?;
@@ -174,6 +207,7 @@ pub fn handle_install_hook(remove: bool) -> Result<()> {
         let files: &[(&str, &str)] = match pm {
             DetectedPm::Pacman => &[(HOOK_INSTALL_PATH, HOOK_INSTALL_TEMPLATE), (HOOK_REMOVE_PATH, HOOK_REMOVE_TEMPLATE)],
             DetectedPm::Apt => &[(APT_HOOK_PATH, APT_HOOK_TEMPLATE)],
+            DetectedPm::Dnf5 => &[(DNF_HOOK_PATH, DNF_HOOK_TEMPLATE)],
         };
         for (path, template) in files {
             let contents = template.replace("/usr/bin/pkgundo", &exe_str);
@@ -187,11 +221,12 @@ pub fn handle_install_hook(remove: bool) -> Result<()> {
     }
 
     if detected.len() > 1 {
-        println!("{} Both pacman and apt/dpkg hooks were installed.", "→".yellow());
+        println!("{} Multiple package-manager hooks were installed.", "→".yellow());
     }
     let (install_cmd, remove_cmd): (&str, &str) = match &detected[0] {
         DetectedPm::Pacman if detected.len() == 1 => ("pacman -S", "pacman -R"),
         DetectedPm::Apt if detected.len() == 1 => ("apt install", "apt remove"),
+        DetectedPm::Dnf5 if detected.len() == 1 => ("dnf install", "dnf remove"),
         _ => ("an install", "a removal"),
     };
     println!(

@@ -147,8 +147,29 @@ pub enum Commands {
     #[command(hide = true)]
     AptHookPost,
 
-    /// Install (or remove) the package-manager hooks (pacman and/or
-    /// apt/dpkg, whichever are detected on this system) that auto-track
+    /// Auto-track a package dnf5's actions plugin reports as newly entering
+    /// the system, if it was explicitly installed (not pulled in only as a
+    /// dependency). Invoked once per package by the `.actions` file
+    /// installed via `pkgundo install-hook`. Not intended for direct
+    /// interactive use.
+    #[command(hide = true)]
+    DnfHookInstall {
+        /// Name of the package dnf5 just installed (via ${pkg.name})
+        package: String,
+    },
+
+    /// Print a reminder if the named package, just removed by dnf5, was
+    /// being tracked. Invoked once per package by the `.actions` file
+    /// installed via `pkgundo install-hook`. Not intended for direct
+    /// interactive use.
+    #[command(hide = true)]
+    DnfHookRemove {
+        /// Name of the package dnf5 just removed (via ${pkg.name})
+        package: String,
+    },
+
+    /// Install (or remove) the package-manager hooks (pacman, apt/dpkg,
+    /// and/or dnf5, whichever are detected on this system) that auto-track
     /// newly installed packages and remind you to review a tracked app's
     /// accumulated $HOME mutations after it's removed. Requires root.
     InstallHook {

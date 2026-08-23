@@ -1,0 +1,9 @@
+# pkgundo: auto-track newly, explicitly installed packages and remind you
+# to review a tracked app's accumulated $HOME mutations after it's
+# removed. dnf5's actions plugin invokes this once per package matching
+# the transaction direction (in = installed, out = removed) rather than
+# once per transaction with a full list — a bulk removal of several
+# tracked packages therefore prints one reminder block per package here,
+# not pacman/apt's single combined summary.
+post_transaction:*:in::/usr/bin/pkgundo dnf-hook-install ${pkg.name}
+post_transaction:*:out::/usr/bin/pkgundo dnf-hook-remove ${pkg.name}

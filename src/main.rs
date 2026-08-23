@@ -37,7 +37,12 @@ async fn main() -> Result<()> {
     // ASCII banner there.
     if !matches!(
         cli.command,
-        Commands::PacmanHook | Commands::PacmanHookInstall | Commands::AptHookPre | Commands::AptHookPost
+        Commands::PacmanHook
+            | Commands::PacmanHookInstall
+            | Commands::AptHookPre
+            | Commands::AptHookPost
+            | Commands::DnfHookInstall { .. }
+            | Commands::DnfHookRemove { .. }
     ) {
         print_banner();
     }
@@ -103,6 +108,14 @@ async fn main() -> Result<()> {
         }
         Commands::AptHookPost => {
             commands::apt_hook::handle_apt_hook_post(db_path).await;
+        }
+        Commands::DnfHookInstall { package } => {
+            // dnf5's actions plugin runs post_transaction — lower stakes
+            // than apt's Pre-Invoke, but the same always-exit-0 contract.
+            commands::dnf_hook::handle_dnf_hook_install(db_path, package).await;
+        }
+        Commands::DnfHookRemove { package } => {
+            commands::dnf_hook::handle_dnf_hook_remove(db_path, package);
         }
         Commands::InstallHook { remove } => {
             commands::hook::handle_install_hook(*remove)?;
