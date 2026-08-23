@@ -151,7 +151,7 @@ echo "== Growing the root filesystem to use the full resized disk =="
 ssh_vm "$IP" "sudo growpart /dev/vda 4 && sudo btrfs filesystem resize max /"
 
 echo "== Installing build tooling + Rust over SSH (has real network access, unlike offline image prep) =="
-ssh_vm "$IP" "sudo dnf install -y --setopt=install_weak_deps=False gcc gcc-c++ make git rsync curl ca-certificates"
+ssh_vm "$IP" "sudo dnf install -y --setopt=install_weak_deps=False gcc gcc-c++ make git rsync curl ca-certificates sqlite"
 # rustup rather than Fedora's repo rustc/cargo: avoids depending on however
 # old/new Fedora's packaged toolchain happens to be at test time — same
 # reasoning as the Debian script.
