@@ -173,6 +173,8 @@ pub async fn run_daemon(db_path: &str) -> Result<()> {
         }
     }
 
+    mutation_capture.btrfs_mounts_cleanup();
+
     // Best-effort cleanup for the non-systemd (manual) run case; under
     // systemd, RuntimeDirectory=pkgundo already removes /run/pkgundo on stop.
     let _ = std::fs::remove_file(SOCKET_PATH);

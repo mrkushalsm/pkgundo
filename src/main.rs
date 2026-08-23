@@ -1,5 +1,6 @@
 mod archive;
 mod blob_store;
+mod btrfs_mount;
 mod classifier;
 mod cli;
 mod commands;

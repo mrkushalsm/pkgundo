@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::btrfs_mount::BtrfsRootMounts;
 use crate::ebpf::{ActiveLaunch, FanotifyMonitor};
 use crate::journal::JournalMessage;
 
@@ -29,6 +30,7 @@ pub struct MutationCapture {
     mutation_tx: mpsc::Sender<JournalMessage>,
     active_launches: Arc<Mutex<HashMap<i32, ActiveLaunch>>>,
     inner: Mutex<Inner>,
+    btrfs_mounts: BtrfsRootMounts,
 }
 
 impl MutationCapture {
@@ -40,7 +42,14 @@ impl MutationCapture {
             mutation_tx,
             active_launches,
             inner: Mutex::new(Inner { refcounts: HashMap::new(), group: None }),
+            btrfs_mounts: BtrfsRootMounts::new(),
         }
+    }
+
+    /// Best-effort teardown of any btrfs proxy mounts created this run —
+    /// called once at daemon shutdown.
+    pub fn btrfs_mounts_cleanup(&self) {
+        self.btrfs_mounts.cleanup();
     }
 
     /// Block until every mutation already captured *as of this call* has
@@ -60,7 +69,8 @@ impl MutationCapture {
     /// launch on it (creating the shared group's fanotify fd + read-loop
     /// task on the very first `start()` ever, across all filesystems).
     pub fn start(&self, home: &Path) -> Result<()> {
-        let dev = std::fs::metadata(home)?.dev();
+        let watch_path = self.btrfs_mounts.resolve(home)?;
+        let dev = std::fs::metadata(&watch_path)?.dev();
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
 
         if inner.group.is_none() {
@@ -73,7 +83,7 @@ impl MutationCapture {
 
         if bump(&mut inner.refcounts, dev) {
             // Safe to unwrap: group was just ensured to exist above.
-            inner.group.as_ref().unwrap().monitor.mark_filesystem(&home.to_string_lossy(), true)?;
+            inner.group.as_ref().unwrap().monitor.mark_filesystem(&watch_path.to_string_lossy(), true)?;
         }
         Ok(())
     }
@@ -82,10 +92,17 @@ impl MutationCapture {
     /// else references it, and tear down the whole shared group once no
     /// filesystem has any remaining reference (idle machines pay nothing).
     pub fn stop(&self, home: &Path) {
-        let dev = match std::fs::metadata(home) {
+        let watch_path = match self.btrfs_mounts.resolve(home) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("MutationCapture::stop: couldn't resolve {}: {}", home.display(), e);
+                return;
+            }
+        };
+        let dev = match std::fs::metadata(&watch_path) {
             Ok(m) => m.dev(),
             Err(e) => {
-                log::warn!("MutationCapture::stop: couldn't stat {}: {}", home.display(), e);
+                log::warn!("MutationCapture::stop: couldn't stat {}: {}", watch_path.display(), e);
                 return;
             }
         };
@@ -93,7 +110,7 @@ impl MutationCapture {
 
         if release(&mut inner.refcounts, dev) {
             if let Some(running) = &inner.group {
-                if let Err(e) = running.monitor.mark_filesystem(&home.to_string_lossy(), false) {
+                if let Err(e) = running.monitor.mark_filesystem(&watch_path.to_string_lossy(), false) {
                     log::warn!("MutationCapture::stop: failed to disarm mark: {}", e);
                 }
             }

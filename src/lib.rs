@@ -2,6 +2,7 @@
 
 pub mod archive;
 pub mod blob_store;
+pub mod btrfs_mount;
 pub mod classifier;
 pub mod cli;
 pub mod daemon;
