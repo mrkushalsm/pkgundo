@@ -35,6 +35,10 @@ sudo install -m 755 target/release/pkgundo /usr/local/bin/pkgundo
 sudo pkgundo setup
 ```
 
+### Native packages (Arch, Debian, Fedora)
+
+Native packaging lives in [`packaging/`](packaging/) — an Arch `PKGBUILD`, and `cargo-deb`/`cargo-generate-rpm` metadata for `.deb`/`.rpm`. Each installs/upgrades/removes via the same `pkgundo setup`/`setup --remove` the other install paths use, so the daemon and package-manager hooks are wired up automatically as part of a normal `pacman -U`/`dpkg -i`/`dnf install` — no separate `pkgundo setup` step needed. GitHub Actions (`.github/workflows/release.yml`) builds a prebuilt binary tarball, `.deb`, and `.rpm`, and attaches a ready-to-use `PKGBUILD`, to every tagged release.
+
 ### `pkgundo setup`
 
 Whichever way you install the binary, `sudo pkgundo setup` is the one command that wires everything up: installs and starts the daemon's systemd unit (enabled on boot), then installs the package-manager hooks for whichever of pacman/apt/dnf5 it detects. It's idempotent — safe to re-run.
@@ -127,7 +131,7 @@ Rollback modes: `conservative` (default — archive aggressively, minimal risk),
 
 ```sh
 pkgundo simulate <command>            # dry-run capability report for a command, no changes made
-pkgundo scan-leftovers <app> --dry-run  # heuristic scan for an app's leftover files under $HOME (pacman systems only, for now)
+pkgundo scan-leftovers <app> --dry-run  # heuristic scan for an app's leftover files under $HOME (pacman, apt/dpkg, and dnf5/rpm)
 ```
 
 ## Supported platforms
@@ -137,9 +141,8 @@ Linux only (relies on `fanotify`). Package-manager hooks support pacman, apt/dpk
 ## Known limitations
 
 - **dnf4 / RHEL / CentOS / older Fedora** isn't supported yet — dnf5's hook mechanism is a different, incompatible plugin from dnf4's.
-- **`scan-leftovers`** is pacman-only for now.
+- **`scan-leftovers`'s already-uninstalled fallback** (matching against a cached package archive rather than a currently-installed one) is best-effort on rpm/dnf5 systems — `dnf`'s `keepcache` setting defaults to off on many installs, so a downloaded `.rpm` is often not still around post-install to match against. Works reliably on pacman and apt/dpkg, which both keep their package cache by default.
 - A tracked app registered by binary path (not a package) has no removal signal — nothing hooks into "the user deleted this binary by hand."
-- No prebuilt release binaries yet — every install path builds from source.
 
 ## License
 

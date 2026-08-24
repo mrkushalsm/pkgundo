@@ -54,19 +54,33 @@ struct Signals {
 }
 
 /// Package metadata lookup, abstracted so tests can supply canned output
-/// instead of shelling out to a real `pacman`/cache dir.
+/// instead of shelling out to a real package manager/cache dir. One impl
+/// per supported package manager (pacman/dpkg/rpm) — see `PacmanMetadataSource`,
+/// `DpkgMetadataSource`, `RpmMetadataSource` below.
 pub trait PackageMetadataSource {
-    /// `pacman -Qi <app>` output, if the package is currently installed.
+    /// Metadata for `app` if currently installed, normalized to the same
+    /// `Key            : value` shape `pacman -Qi` uses regardless of which
+    /// package manager this source wraps (`extract_field` only ever looks
+    /// for that one shape plus `.PKGINFO`'s `key = value` shape) — e.g. a
+    /// dpkg-backed source still emits `Name            : <pkg>` even though
+    /// `dpkg -s` itself would say `Package:`. This keeps `derive_signals`'s
+    /// shared parsing logic below completely package-manager-agnostic.
     fn query_info(&self, app: &str) -> Option<String>;
-    /// `pacman -Ql <app>` output, if the package is currently installed.
-    fn query_files(&self, app: &str) -> Option<String>;
-    /// Path to a cached package archive for `app` under
-    /// `/var/cache/pacman/pkg/`, if one exists (most recent mtime wins).
+    /// Every file `app` owns, as bare absolute paths (no leading package-name
+    /// token — pacman's own `-Ql` output is the one exception, so
+    /// `PacmanMetadataSource` strips that prefix itself before returning).
+    fn query_files(&self, app: &str) -> Option<Vec<String>>;
+    /// Path to a cached package archive for `app` (pacman: `/var/cache/pacman/pkg/`,
+    /// dpkg: `/var/cache/apt/archives/`, rpm: best-effort under dnf's cache
+    /// dirs, which aren't guaranteed to be populated), if one exists (most
+    /// recent mtime wins).
     fn cached_archive(&self, app: &str) -> Option<PathBuf>;
-    /// `.PKGINFO` contents extracted from a cached archive.
+    /// Metadata extracted from a cached archive, same normalized shape as
+    /// `query_info`.
     fn archive_pkginfo(&self, archive: &Path) -> Option<String>;
-    /// File list extracted from a cached archive (one path per line).
-    fn archive_file_list(&self, archive: &Path) -> Option<String>;
+    /// File list extracted from a cached archive, same normalized bare-path
+    /// shape as `query_files`.
+    fn archive_file_list(&self, archive: &Path) -> Option<Vec<String>>;
     /// Read a file's contents (used for `.desktop`/`.metainfo.xml` files
     /// referenced by a package's file list). Real impl just reads from disk;
     /// tests can supply canned content instead.
@@ -89,10 +103,18 @@ impl PackageMetadataSource for PacmanMetadataSource {
         }
     }
 
-    fn query_files(&self, app: &str) -> Option<String> {
+    fn query_files(&self, app: &str) -> Option<Vec<String>> {
         let out = Command::new("pacman").args(["-Ql", app]).output().ok()?;
         if out.status.success() {
-            Some(String::from_utf8_lossy(&out.stdout).to_string())
+            // `pacman -Ql` lines are `<pkg> <path>` — strip the leading
+            // package-name token so callers see the same bare-path shape
+            // every other source returns.
+            Some(
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .filter_map(|l| l.split_once(' ').map(|(_, p)| p.trim().to_string()))
+                    .collect(),
+            )
         } else {
             None
         }
@@ -128,10 +150,10 @@ impl PackageMetadataSource for PacmanMetadataSource {
         }
     }
 
-    fn archive_file_list(&self, archive: &Path) -> Option<String> {
+    fn archive_file_list(&self, archive: &Path) -> Option<Vec<String>> {
         let out = Command::new("bsdtar").args(["-tf", archive.to_str()?]).output().ok()?;
         if out.status.success() {
-            Some(String::from_utf8_lossy(&out.stdout).to_string())
+            Some(String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect())
         } else {
             None
         }
@@ -149,6 +171,258 @@ impl PackageMetadataSource for PacmanMetadataSource {
             None
         }
     }
+}
+
+/// Best-effort: newest matching cache entry under `cache_dir` whose filename
+/// (via `parse_name`) resolves to `app`. Shared by dpkg's and rpm's
+/// `cached_archive` impls, which only differ in `cache_dir` and their
+/// filename-parsing convention.
+fn newest_cached_archive(cache_dir: &Path, app: &str, parse_name: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    let entries = fs::read_dir(cache_dir).ok()?;
+    let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let fname = match path.file_name().and_then(|f| f.to_str()) {
+            Some(f) => f,
+            None => continue,
+        };
+        if parse_name(fname).as_deref() != Some(app) {
+            continue;
+        }
+        let mtime = match entry.metadata().and_then(|m| m.modified()) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if best.as_ref().map(|(_, t)| mtime > *t).unwrap_or(true) {
+            best = Some((path, mtime));
+        }
+    }
+    best.map(|(p, _)| p)
+}
+
+/// Parse a `.deb` cache filename (`<name>_<version>_<arch>.deb`) and return
+/// just `<name>`.
+fn parse_deb_archive_name(fname: &str) -> Option<String> {
+    let no_ext = fname.strip_suffix(".deb")?;
+    no_ext.split('_').next().map(str::to_string)
+}
+
+pub struct DpkgMetadataSource;
+
+impl PackageMetadataSource for DpkgMetadataSource {
+    fn query_info(&self, app: &str) -> Option<String> {
+        // dpkg-query's own field names (Package/Homepage) don't match
+        // pacman-Qi's (Name/URL) — request the normalized shape directly via
+        // a custom format string so the shared `extract_field` parsing in
+        // this module needs no dpkg-specific knowledge at all.
+        let out = Command::new("dpkg-query")
+            .args(["-W", "-f=Name            : ${Package}\nURL             : ${Homepage}\n", app])
+            .output()
+            .ok()?;
+        if out.status.success() {
+            Some(String::from_utf8_lossy(&out.stdout).to_string())
+        } else {
+            None
+        }
+    }
+
+    fn query_files(&self, app: &str) -> Option<Vec<String>> {
+        let out = Command::new("dpkg").args(["-L", app]).output().ok()?;
+        if out.status.success() {
+            Some(String::from_utf8_lossy(&out.stdout).lines().map(str::trim).map(String::from).collect())
+        } else {
+            None
+        }
+    }
+
+    fn cached_archive(&self, app: &str) -> Option<PathBuf> {
+        newest_cached_archive(Path::new("/var/cache/apt/archives"), app, parse_deb_archive_name)
+    }
+
+    fn archive_pkginfo(&self, archive: &Path) -> Option<String> {
+        // `dpkg-deb -I` dumps the .deb's control file verbatim, which is
+        // already `Key: Value` per line — but with dpkg's own field names
+        // (Package/Homepage), so still needs remapping into the shared
+        // Name/URL shape (unlike `-f` with an explicit format string, `-I`
+        // has no per-field templating option).
+        let out = Command::new("dpkg-deb").args(["-I", archive.to_str()?]).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let control = String::from_utf8_lossy(&out.stdout);
+        let name = extract_field(&control, "Package", "Package")?;
+        let url = extract_field(&control, "Homepage", "Homepage").unwrap_or("");
+        Some(format!("Name            : {name}\nURL             : {url}\n"))
+    }
+
+    fn archive_file_list(&self, archive: &Path) -> Option<Vec<String>> {
+        // `dpkg-deb -c` lines look like:
+        //   -rwxr-xr-x root/root  12345 2024-01-01 12:00 ./usr/bin/foo
+        // the path is always the last whitespace-separated field.
+        let out = Command::new("dpkg-deb").args(["-c", archive.to_str()?]).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        Some(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|l| l.split_whitespace().last())
+                .map(|p| format!("/{}", p.trim_start_matches("./")))
+                .collect(),
+        )
+    }
+
+    fn read_file(&self, path: &str) -> Option<String> {
+        fs::read_to_string(path).ok()
+    }
+
+    fn read_file_in_archive(&self, archive: &Path, rel_path: &str) -> Option<String> {
+        // .deb has no single-tool "extract one file to stdout" (unlike
+        // bsdtar -xOf) — pipe dpkg-deb's own tarball extraction into tar,
+        // via real process piping rather than a shell string (rel_path
+        // comes from a package's own file listing, not sanitized for
+        // shell-safety).
+        use std::process::Stdio;
+        let mut fsys = Command::new("dpkg-deb")
+            .args(["--fsys-tarfile", archive.to_str()?])
+            .stdout(Stdio::piped())
+            .spawn()
+            .ok()?;
+        let fsys_stdout = fsys.stdout.take()?;
+        let out = Command::new("tar")
+            .args(["-xO", &format!("./{}", rel_path.trim_start_matches('/'))])
+            .stdin(fsys_stdout)
+            .output()
+            .ok()?;
+        let _ = fsys.wait();
+        if out.status.success() && !out.stdout.is_empty() {
+            Some(String::from_utf8_lossy(&out.stdout).to_string())
+        } else {
+            None
+        }
+    }
+}
+
+pub struct RpmMetadataSource;
+
+impl PackageMetadataSource for RpmMetadataSource {
+    fn query_info(&self, app: &str) -> Option<String> {
+        // rpm -qi's own field names (Name/URL) already match pacman -Qi's
+        // shape exactly — no remapping needed.
+        let out = Command::new("rpm").args(["-qi", app]).output().ok()?;
+        if out.status.success() {
+            Some(String::from_utf8_lossy(&out.stdout).to_string())
+        } else {
+            None
+        }
+    }
+
+    fn query_files(&self, app: &str) -> Option<Vec<String>> {
+        let out = Command::new("rpm").args(["-ql", app]).output().ok()?;
+        if out.status.success() {
+            Some(String::from_utf8_lossy(&out.stdout).lines().map(str::trim).map(String::from).collect())
+        } else {
+            None
+        }
+    }
+
+    fn cached_archive(&self, app: &str) -> Option<PathBuf> {
+        // Best-effort only: unlike apt, dnf's `keepcache` setting defaults
+        // to off on many modern installs (Fedora's dnf5 included), so a
+        // downloaded .rpm is often not still around post-install at all —
+        // this just checks the couple of directories where one might be.
+        for dir in ["/var/cache/libdnf5/system/packages", "/var/cache/dnf"] {
+            if let Some(found) = newest_cached_rpm_recursive(Path::new(dir), app) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    fn archive_pkginfo(&self, archive: &Path) -> Option<String> {
+        // rpm -qip's output is the exact same "Name        : x" shape as
+        // -qi's — no remapping needed here either.
+        let out = Command::new("rpm").args(["-qip", archive.to_str()?]).output().ok()?;
+        if out.status.success() {
+            Some(String::from_utf8_lossy(&out.stdout).to_string())
+        } else {
+            None
+        }
+    }
+
+    fn archive_file_list(&self, archive: &Path) -> Option<Vec<String>> {
+        let out = Command::new("rpm").args(["-qlp", archive.to_str()?]).output().ok()?;
+        if out.status.success() {
+            Some(String::from_utf8_lossy(&out.stdout).lines().map(str::trim).map(String::from).collect())
+        } else {
+            None
+        }
+    }
+
+    fn read_file(&self, path: &str) -> Option<String> {
+        fs::read_to_string(path).ok()
+    }
+
+    fn read_file_in_archive(&self, archive: &Path, rel_path: &str) -> Option<String> {
+        use std::process::Stdio;
+        let mut rpm2cpio = Command::new("rpm2cpio").arg(archive).stdout(Stdio::piped()).spawn().ok()?;
+        let rpm2cpio_stdout = rpm2cpio.stdout.take()?;
+        let out = Command::new("cpio")
+            .args(["--extract", "--to-stdout", &format!("./{}", rel_path.trim_start_matches('/'))])
+            .stdin(rpm2cpio_stdout)
+            .output()
+            .ok()?;
+        let _ = rpm2cpio.wait();
+        if out.status.success() && !out.stdout.is_empty() {
+            Some(String::from_utf8_lossy(&out.stdout).to_string())
+        } else {
+            None
+        }
+    }
+}
+
+/// Recursively searches under `dir` for an rpm file resolving (via
+/// `rpm -qp --qf`) to `app`'s package name — dnf's own cache layout nests
+/// packages under a per-repo subdirectory, so a shallow single-directory
+/// scan (like `newest_cached_archive` does for apt/pacman) isn't enough.
+fn newest_cached_rpm_recursive(dir: &Path, app: &str) -> Option<PathBuf> {
+    let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let entries = match fs::read_dir(&d) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rpm") {
+                continue;
+            }
+            let path_str = match path.to_str() {
+                Some(s) => s,
+                None => continue,
+            };
+            let out = match Command::new("rpm").args(["-qp", "--qf", "%{NAME}", path_str]).output() {
+                Ok(o) if o.status.success() => o,
+                _ => continue,
+            };
+            if String::from_utf8_lossy(&out.stdout) != app {
+                continue;
+            }
+            let mtime = match entry.metadata().and_then(|m| m.modified()) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if best.as_ref().map(|(_, t)| mtime > *t).unwrap_or(true) {
+                best = Some((path, mtime));
+            }
+        }
+    }
+    best.map(|(p, _)| p)
 }
 
 /// Parse a pacman cache filename (`<name>-<version>-<pkgrel>-<arch>.pkg.tar.<ext>`)
@@ -208,15 +482,15 @@ fn vendor_token_from_url(url: &str) -> Option<String> {
     labels.first().map(|s| s.to_lowercase())
 }
 
-/// `file_list` is expected to already be bare absolute paths, one per line
-/// (no leading `<pkg> ` prefix as `pacman -Ql` uses) — call sites normalize.
+/// `file_list` is already-normalized bare absolute paths (every
+/// `PackageMetadataSource` impl returns this shape — see the trait doc).
 /// `archive` is `Some` when the package is already uninstalled: the live
 /// paths in `file_list` no longer exist on disk, so referenced files
 /// (`.desktop`/`.metainfo.xml` content) must be read straight out of the
 /// cached archive instead.
 fn collect_desktop_and_appstream_tokens(
     source: &dyn PackageMetadataSource,
-    file_list: &str,
+    file_list: &[String],
     archive: Option<&Path>,
     tokens: &mut HashSet<String>,
     binaries: &mut HashSet<String>,
@@ -227,7 +501,7 @@ fn collect_desktop_and_appstream_tokens(
             None => source.read_file(path),
         }
     };
-    for line in file_list.lines() {
+    for line in file_list {
         let path = line.trim();
         if path.ends_with('/') || path.is_empty() {
             continue;
@@ -280,7 +554,9 @@ fn derive_signals(app: &str, source: &dyn PackageMetadataSource) -> Signals {
         ..Default::default()
     };
 
-    // Stage 1: still installed. `pacman -Ql` lines are `<pkg> <path>`.
+    // Stage 1: still installed. Every source normalizes to bare absolute
+    // paths (see the trait doc), so the same bare-path executable filter
+    // applies regardless of which package manager `source` wraps.
     // Only treat the app name itself as a "likely" (structural) signal once
     // metadata actually confirms it names a real package — otherwise it's
     // indistinguishable from the raw/guess-tier fallback below.
@@ -288,43 +564,29 @@ fn derive_signals(app: &str, source: &dyn PackageMetadataSource) -> Signals {
         signals.likely.insert(app.to_lowercase());
         apply_metadata(&mut signals, &info);
         if let Some(files) = source.query_files(app) {
-            let binaries = crate::tracked_apps::executable_binaries_from_listing(&files);
+            let binaries = crate::tracked_apps::executable_binaries_from_dpkg_listing(&files.join("\n"));
             for b in &binaries {
                 if let Some(name) = Path::new(b).file_name().and_then(|s| s.to_str()) {
                     signals.likely.insert(name.to_lowercase());
                 }
             }
-            let bare_paths: Vec<&str> = files
-                .lines()
-                .filter_map(|line| line.split_once(' ').map(|(_, p)| p.trim()))
-                .collect();
             let mut extra_bins = HashSet::new();
-            collect_desktop_and_appstream_tokens(
-                source,
-                &bare_paths.join("\n"),
-                None,
-                &mut signals.structural,
-                &mut extra_bins,
-            );
+            collect_desktop_and_appstream_tokens(source, &files, None, &mut signals.structural, &mut extra_bins);
             signals.likely.extend(extra_bins);
         }
         return signals;
     }
 
     // Stage 2: not installed, but a cached archive may still exist.
-    // `bsdtar -tf` lines are already bare (relative) paths, no `<pkg> ` prefix.
     if let Some(archive) = source.cached_archive(app) {
         signals.likely.insert(app.to_lowercase());
         if let Some(pkginfo) = source.archive_pkginfo(&archive) {
             apply_metadata(&mut signals, &pkginfo);
         }
         if let Some(files) = source.archive_file_list(&archive) {
-            let abs_paths: Vec<String> = files
-                .lines()
-                .map(|l| format!("/{}", l.trim_start_matches("./").trim_start_matches('/')))
-                .collect();
-            let listing_for_binaries = abs_paths.iter().map(|p| format!("{} {}", app, p)).collect::<Vec<_>>().join("\n");
-            let binaries = crate::tracked_apps::executable_binaries_from_listing(&listing_for_binaries);
+            let abs_paths: Vec<String> =
+                files.iter().map(|l| format!("/{}", l.trim_start_matches("./").trim_start_matches('/'))).collect();
+            let binaries = crate::tracked_apps::executable_binaries_from_dpkg_listing(&abs_paths.join("\n"));
             for b in &binaries {
                 if let Some(name) = Path::new(b).file_name().and_then(|s| s.to_str()) {
                     signals.likely.insert(name.to_lowercase());
@@ -333,7 +595,7 @@ fn derive_signals(app: &str, source: &dyn PackageMetadataSource) -> Signals {
             let mut extra_bins = HashSet::new();
             collect_desktop_and_appstream_tokens(
                 source,
-                &abs_paths.join("\n"),
+                &abs_paths,
                 Some(&archive),
                 &mut signals.structural,
                 &mut extra_bins,
@@ -438,8 +700,27 @@ pub fn scan_with_home(
     Ok(candidates)
 }
 
+fn which_ok(bin: &str) -> bool {
+    Command::new("which").arg(bin).output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+/// Auto-detects which package manager is present (same pacman -> dpkg -> rpm
+/// precedence `tracked_apps::resolve_app_targets` already uses) and scans
+/// using the matching `PackageMetadataSource`. On a system with none of the
+/// three, `PacmanMetadataSource` is used anyway — every one of its methods
+/// already degrades to `None` when the underlying binary is missing, which
+/// `derive_signals` already treats as "stage 3: raw string only", so this
+/// stays a safe, already-tested fallback rather than a new code path.
 pub fn scan_leftovers(app: &str) -> Result<Vec<LeftoverCandidate>> {
-    scan_with_home(app, None, &PacmanMetadataSource)
+    if which_ok("pacman") {
+        scan_with_home(app, None, &PacmanMetadataSource)
+    } else if which_ok("dpkg") {
+        scan_with_home(app, None, &DpkgMetadataSource)
+    } else if which_ok("rpm") {
+        scan_with_home(app, None, &RpmMetadataSource)
+    } else {
+        scan_with_home(app, None, &PacmanMetadataSource)
+    }
 }
 
 /// Resolve the real invoking user's home directory `getent`-style, even
@@ -509,7 +790,7 @@ mod tests {
 
     struct FakeSource {
         info: HashMap<String, String>,
-        files: HashMap<String, String>,
+        files: HashMap<String, Vec<String>>,
         file_contents: HashMap<String, String>,
     }
 
@@ -517,7 +798,7 @@ mod tests {
         fn query_info(&self, app: &str) -> Option<String> {
             self.info.get(app).cloned()
         }
-        fn query_files(&self, app: &str) -> Option<String> {
+        fn query_files(&self, app: &str) -> Option<Vec<String>> {
             self.files.get(app).cloned()
         }
         fn cached_archive(&self, _app: &str) -> Option<PathBuf> {
@@ -526,7 +807,7 @@ mod tests {
         fn archive_pkginfo(&self, _archive: &Path) -> Option<String> {
             None
         }
-        fn archive_file_list(&self, _archive: &Path) -> Option<String> {
+        fn archive_file_list(&self, _archive: &Path) -> Option<Vec<String>> {
             None
         }
         fn read_file(&self, path: &str) -> Option<String> {
@@ -546,8 +827,11 @@ mod tests {
         let mut files = HashMap::new();
         files.insert(
             "firefox".to_string(),
-            "firefox /usr/lib/firefox/firefox\nfirefox /usr/bin/firefox\nfirefox /usr/share/applications/firefox.desktop\n"
-                .to_string(),
+            vec![
+                "/usr/lib/firefox/firefox".to_string(),
+                "/usr/bin/firefox".to_string(),
+                "/usr/share/applications/firefox.desktop".to_string(),
+            ],
         );
         FakeSource { info, files, file_contents: HashMap::new() }
     }
@@ -569,7 +853,7 @@ mod tests {
             fn query_info(&self, _app: &str) -> Option<String> {
                 None
             }
-            fn query_files(&self, _app: &str) -> Option<String> {
+            fn query_files(&self, _app: &str) -> Option<Vec<String>> {
                 None
             }
             fn cached_archive(&self, app: &str) -> Option<PathBuf> {
@@ -578,8 +862,8 @@ mod tests {
             fn archive_pkginfo(&self, _archive: &Path) -> Option<String> {
                 Some("pkgname = firefox\nurl = https://www.mozilla.org/firefox/\n".to_string())
             }
-            fn archive_file_list(&self, _archive: &Path) -> Option<String> {
-                Some("usr/lib/firefox/firefox\nusr/bin/firefox\n".to_string())
+            fn archive_file_list(&self, _archive: &Path) -> Option<Vec<String>> {
+                Some(vec!["usr/lib/firefox/firefox".to_string(), "usr/bin/firefox".to_string()])
             }
             fn read_file(&self, _path: &str) -> Option<String> {
                 None
@@ -608,7 +892,7 @@ mod tests {
             fn query_info(&self, _app: &str) -> Option<String> {
                 None
             }
-            fn query_files(&self, _app: &str) -> Option<String> {
+            fn query_files(&self, _app: &str) -> Option<Vec<String>> {
                 None
             }
             fn cached_archive(&self, app: &str) -> Option<PathBuf> {
@@ -617,8 +901,8 @@ mod tests {
             fn archive_pkginfo(&self, _archive: &Path) -> Option<String> {
                 Some("pkgname = firefox\nurl = https://www.firefox.com/\n".to_string())
             }
-            fn archive_file_list(&self, _archive: &Path) -> Option<String> {
-                Some("usr/share/metainfo/org.mozilla.firefox.metainfo.xml\n".to_string())
+            fn archive_file_list(&self, _archive: &Path) -> Option<Vec<String>> {
+                Some(vec!["usr/share/metainfo/org.mozilla.firefox.metainfo.xml".to_string()])
             }
             fn read_file(&self, _path: &str) -> Option<String> {
                 None // live disk copy is gone; must come from the archive
@@ -671,5 +955,12 @@ mod tests {
     fn parses_pkg_archive_name_right_to_left() {
         assert_eq!(parse_pkg_archive_name("firefox-128.0-1-x86_64.pkg.tar.zst").as_deref(), Some("firefox"));
         assert_eq!(parse_pkg_archive_name("code-oss-1.90.0-1-x86_64.pkg.tar.zst").as_deref(), Some("code-oss"));
+    }
+
+    #[test]
+    fn parses_deb_archive_name() {
+        assert_eq!(parse_deb_archive_name("firefox-esr_128.0-1_amd64.deb").as_deref(), Some("firefox-esr"));
+        assert_eq!(parse_deb_archive_name("cowsay_3.03+dfsg2-8_all.deb").as_deref(), Some("cowsay"));
+        assert_eq!(parse_deb_archive_name("not-a-deb.txt"), None);
     }
 }
