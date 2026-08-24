@@ -1,0 +1,128 @@
+name: Release
+
+# Builds a prebuilt binary tarball, a .deb, and a .rpm, then attaches all
+# three (plus a ready-to-use copy of the Arch PKGBUILD, with its
+# sha256sums patched to the real release tarball's hash) to a GitHub
+# Release. Triggered by pushing a `vX.Y.Z` tag; also runnable manually via
+# workflow_dispatch for testing without cutting a real release.
+#
+# Built on ubuntu-22.04 deliberately, not ubuntu-latest: glibc symbol
+# versioning is forward-only (a binary linked against a newer glibc
+# refuses to run on an older one), so building on an older/more
+# conservative baseline is what makes the same binary/.deb work across
+# Debian 12, Fedora 41+, and Arch — confirmed the hard way while testing
+# this packaging by hand: a binary built on a bleeding-edge Arch dev
+# machine failed with "GLIBC_2.39 not found" on a Debian 12 VM.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version from the pushed tag
+        id: version
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Verify Cargo.toml's version matches the pushed tag
+        if: github.ref_type == 'tag'
+        run: |
+          set -euo pipefail
+          CARGO_VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          if [ "$CARGO_VERSION" != "${{ steps.version.outputs.version }}" ]; then
+            echo "::error::Cargo.toml version ($CARGO_VERSION) doesn't match the pushed tag (${{ github.ref_name }}) — bump Cargo.toml and re-tag."
+            exit 1
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev
+          cargo install cargo-deb --locked
+          cargo install cargo-generate-rpm --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Run tests
+        run: cargo test --release --locked
+
+      - name: Package release tarball
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          STAGE="pkgundo-${VERSION}-x86_64-linux"
+          mkdir -p "$STAGE"
+          cp target/release/pkgundo "$STAGE/"
+          cp README.md LICENSE install.sh "$STAGE/"
+          cp -r systemd hooks "$STAGE/"
+          tar -czf "${STAGE}.tar.gz" "$STAGE"
+
+      - name: Build .deb
+        run: cargo deb
+
+      - name: Build .rpm
+        run: cargo generate-rpm
+
+      - name: Prepare a ready-to-use Arch PKGBUILD
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          OUT="pkgundo-${VERSION}.PKGBUILD"
+          cp packaging/arch/PKGBUILD "$OUT"
+          sed -i "s/^pkgver=.*/pkgver=${VERSION}/" "$OUT"
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            TARBALL_URL="https://github.com/${{ github.repository }}/archive/refs/tags/${{ github.ref_name }}.tar.gz"
+            SHA256="$(curl -fsSL "$TARBALL_URL" | sha256sum | cut -d' ' -f1)"
+            sed -i "s/^sha256sums=.*/sha256sums=('${SHA256}')/" "$OUT"
+          fi
+          cp packaging/arch/pkgundo.install "pkgundo.install"
+
+      # Only a real tag push publishes a public GitHub Release; a manual
+      # workflow_dispatch run (used to validate this workflow itself)
+      # just uploads the same artifacts to the Actions run instead, so
+      # testing this pipeline can never accidentally publish a release.
+      - name: Create GitHub Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            pkgundo-*-x86_64-linux.tar.gz
+            target/debian/*.deb
+            target/generate-rpm/*.rpm
+            pkgundo-*.PKGBUILD
+            pkgundo.install
+
+      - name: Upload build artifacts (manual/dry-run only)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkgundo-packages
+          path: |
+            pkgundo-*-x86_64-linux.tar.gz
+            target/debian/*.deb
+            target/generate-rpm/*.rpm
+            pkgundo-*.PKGBUILD
+            pkgundo.install
